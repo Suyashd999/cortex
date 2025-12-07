@@ -581,6 +581,49 @@ class CortexCLI:
         return 0
 
 
+def show_rich_help():
+    """Display beautifully formatted help using Rich"""
+    from rich.table import Table
+
+    show_banner(show_version=True)
+    console.print()
+
+    console.print("[bold]AI-powered package manager for Linux[/bold]")
+    console.print("[dim]Just tell Cortex what you want to install.[/dim]")
+    console.print()
+
+    # Commands table
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("Command", style="green")
+    table.add_column("Description")
+
+    table.add_row("demo", "See Cortex in action (no API key needed)")
+    table.add_row("install <pkg>", "Install software using natural language")
+    table.add_row("history", "View installation history")
+    table.add_row("rollback <id>", "Undo an installation")
+    table.add_row("check-pref", "View configuration")
+    table.add_row("wizard", "Configure API key (coming soon)")
+
+    console.print(table)
+    console.print()
+
+    # Quick start
+    console.print("[bold cyan]Quick Start:[/bold cyan]")
+    console.print("  1. [dim]Set API key:[/dim]  export ANTHROPIC_API_KEY='sk-ant-...'")
+    console.print("  2. [dim]Install:[/dim]      cortex install docker --execute")
+    console.print()
+
+    # Flags
+    console.print("[bold cyan]Flags:[/bold cyan]")
+    console.print("  --execute    Actually run the commands (default: preview only)")
+    console.print("  --dry-run    Show what would happen without doing anything")
+    console.print("  --verbose    Show debug information")
+    console.print("  --version    Show version number")
+    console.print()
+
+    console.print("[dim]Learn more: https://cortexlinux.com/docs[/dim]")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='cortex',
@@ -644,8 +687,8 @@ Environment Variables:
     args = parser.parse_args()
     
     if not args.command:
-        parser.print_help()
-        return 1
+        show_rich_help()
+        return 0
 
     cli = CortexCLI(verbose=args.verbose)
     
