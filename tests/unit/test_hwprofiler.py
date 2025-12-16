@@ -5,11 +5,15 @@ Tests various hardware configurations and edge cases.
 """
 
 import json
+import os
 import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
 
-from hwprofiler import HardwareProfiler
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from cortex.hwprofiler import HardwareProfiler
 
 
 class TestHardwareProfiler(unittest.TestCase):

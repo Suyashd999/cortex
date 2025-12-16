@@ -3,9 +3,13 @@
 Tests for Error Parser System
 """
 
+import os
+import sys
 import unittest
 
-from error_parser import ErrorCategory, ErrorParser
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from cortex.error_parser import ErrorCategory, ErrorParser
 
 
 class TestErrorParser(unittest.TestCase):

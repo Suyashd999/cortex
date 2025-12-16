@@ -13,9 +13,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 # Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from llm_router import LLMProvider, LLMResponse, LLMRouter, TaskType, complete_task
+from cortex.llm_router import LLMProvider, LLMResponse, LLMRouter, TaskType, complete_task
 
 
 class TestRoutingLogic(unittest.TestCase):

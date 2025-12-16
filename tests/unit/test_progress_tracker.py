@@ -4,11 +4,16 @@ Tests for Progress Tracker module.
 """
 
 import asyncio
+import os
+import sys
 import time
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from progress_tracker import (
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from cortex.progress_tracker import (
     ProgressStage,
     ProgressTracker,
     RichProgressTracker,

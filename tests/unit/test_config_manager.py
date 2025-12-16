@@ -7,13 +7,17 @@ Tests all functionality with mocked system calls.
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import yaml
-from config_manager import ConfigManager
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from cortex.config_manager import ConfigManager
 
 
 class TestConfigManager(unittest.TestCase):
