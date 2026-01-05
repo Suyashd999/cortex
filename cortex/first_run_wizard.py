@@ -390,8 +390,11 @@ Cortex uses AI to understand your commands. You can use:
 
         if choice == "5":
             model_name = self._prompt("Enter model name: ", default="llama3.2")
-        else:
+        elif choice in model_choices:
             model_name = model_choices[choice]
+        else:
+            print(f"Invalid choice '{choice}', using default model llama3.2")
+            model_name = "llama3.2"
 
         # Pull the selected model
         print(f"\nPulling {model_name} model (this may take a few minutes)...")

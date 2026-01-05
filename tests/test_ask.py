@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -260,7 +261,7 @@ class TestAskHandlerProviders(unittest.TestCase):
         # Point the home directory to a temporary location without ~/.cortex/config.json
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            patch("os.path.expanduser", return_value=tmpdir),
+            patch("cortex.config_utils.Path.home", return_value=Path(tmpdir)),
         ):
             handler2 = AskHandler(api_key="test", provider="ollama")
             # When no env var and no config file exist, AskHandler should use its built-in default.
