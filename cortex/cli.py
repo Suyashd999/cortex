@@ -506,7 +506,7 @@ class CortexCLI:
 
     # --- End Sandbox Commands ---
 
-    def ask(self, question: str) -> int:
+    def ask(self, question: str, debug: bool = False) -> int:
         """Answer a natural language question about the system."""
         api_key = self._get_api_key()
         if not api_key:
@@ -519,6 +519,7 @@ class CortexCLI:
             handler = AskHandler(
                 api_key=api_key,
                 provider=provider,
+                debug=debug,
             )
             answer = handler.ask(question)
             console.print(answer)
@@ -1630,6 +1631,7 @@ def main():
     # Ask command
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your system")
     ask_parser.add_argument("question", type=str, help="Natural language question")
+    ask_parser.add_argument("--debug", action="store_true", help="Show debug output for agentic loop")
 
     # Install command
     install_parser = subparsers.add_parser("install", help="Install software")
@@ -1875,7 +1877,7 @@ def main():
         elif args.command == "status":
             return cli.status()
         elif args.command == "ask":
-            return cli.ask(args.question)
+            return cli.ask(args.question, debug=args.debug)
         elif args.command == "install":
             return cli.install(
                 args.software,
