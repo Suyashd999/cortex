@@ -506,8 +506,12 @@ class CortexCLI:
 
     # --- End Sandbox Commands ---
 
-    def ask(self, question: str, debug: bool = False) -> int:
-        """Answer a natural language question about the system."""
+    def ask(self, question: str | None, debug: bool = False, do_mode: bool = False) -> int:
+        """Answer a natural language question about the system.
+        
+        In --do mode, Cortex can execute write and modify commands with user confirmation.
+        If no question is provided in --do mode, starts an interactive session.
+        """
         api_key = self._get_api_key()
         if not api_key:
             return 1
@@ -515,12 +519,31 @@ class CortexCLI:
         provider = self._get_provider()
         self._debug(f"Using provider: {provider}")
 
+        # Setup cortex user if in do mode
+        if do_mode:
+            try:
+                from cortex.do_runner import setup_cortex_user
+                cx_print("🔧 Do mode enabled - Cortex can execute commands to solve problems", "info")
+                # Don't fail if user creation fails - we have fallbacks
+                setup_cortex_user()
+            except Exception as e:
+                self._debug(f"Cortex user setup skipped: {e}")
+
         try:
             handler = AskHandler(
                 api_key=api_key,
                 provider=provider,
                 debug=debug,
+                do_mode=do_mode,
             )
+            
+            # If no question and in do mode, start interactive session
+            if question is None and do_mode:
+                return self._run_interactive_do_session(handler)
+            elif question is None:
+                self._print_error("Please provide a question or use --do for interactive mode")
+                return 1
+            
             answer = handler.ask(question)
             console.print(answer)
             return 0
@@ -537,6 +560,114 @@ class CortexCLI:
         except RuntimeError as e:
             self._print_error(str(e))
             return 1
+    
+    def _run_interactive_do_session(self, handler: AskHandler) -> int:
+        """Run an interactive --do session where user can type queries."""
+        from rich.panel import Panel
+        from rich.prompt import Prompt
+        
+        console.print()
+        console.print(Panel(
+            "[bold cyan]🚀 Cortex Interactive Session[/bold cyan]\n\n"
+            "Type what you want to do and Cortex will help you.\n"
+            "Commands will be shown for approval before execution.\n\n"
+            "[dim]Examples:[/dim]\n"
+            "  • install docker and run nginx\n"
+            "  • setup a postgresql database\n"
+            "  • configure nginx to proxy port 3000\n"
+            "  • check system resources\n\n"
+            "[dim]Type 'exit' or 'quit' to end the session.[/dim]",
+            title="[bold green]Welcome[/bold green]",
+            border_style="cyan",
+        ))
+        console.print()
+        
+        session_history = []  # Track what was done in this session
+        
+        while True:
+            try:
+                # Show session context if we have history
+                if session_history:
+                    console.print(f"[dim]Session: {len(session_history)} task(s) completed[/dim]")
+                
+                # Get user input
+                query = Prompt.ask("[bold cyan]What would you like to do?[/bold cyan]")
+                
+                if not query.strip():
+                    continue
+                
+                # Check for exit
+                if query.lower().strip() in ["exit", "quit", "bye", "q"]:
+                    console.print()
+                    console.print("[cyan]👋 Session ended. Run 'cortex do history' to see past runs.[/cyan]")
+                    break
+                
+                # Check for help
+                if query.lower().strip() in ["help", "?"]:
+                    console.print()
+                    console.print("[bold]Available commands:[/bold]")
+                    console.print("  [green]exit[/green], [green]quit[/green] - End the session")
+                    console.print("  [green]history[/green] - Show session history")
+                    console.print("  [green]clear[/green] - Clear session history")
+                    console.print("  Or type any request in natural language!")
+                    console.print()
+                    continue
+                
+                # Check for history
+                if query.lower().strip() == "history":
+                    if session_history:
+                        console.print()
+                        console.print("[bold]Session history:[/bold]")
+                        for i, item in enumerate(session_history, 1):
+                            status = "✓" if item.get("success") else "✗"
+                            console.print(f"  {i}. [{status}] {item['query'][:50]}...")
+                        console.print()
+                    else:
+                        console.print("[dim]No tasks completed yet.[/dim]")
+                    continue
+                
+                # Check for clear
+                if query.lower().strip() == "clear":
+                    session_history.clear()
+                    console.print("[dim]Session history cleared.[/dim]")
+                    continue
+                
+                # Process the query
+                console.print()
+                try:
+                    answer = handler.ask(query)
+                    
+                    # Track in session history
+                    session_history.append({
+                        "query": query,
+                        "success": True,
+                        "answer": answer[:100] if answer else "",
+                    })
+                    
+                    # Print response if it's informational
+                    if answer and not answer.startswith("USER_DECLINED"):
+                        console.print(answer)
+                    
+                except Exception as e:
+                    console.print(f"[red]Error: {e}[/red]")
+                    session_history.append({
+                        "query": query,
+                        "success": False,
+                        "error": str(e),
+                    })
+                
+                console.print()
+                
+            except KeyboardInterrupt:
+                console.print()
+                console.print("[cyan]👋 Session ended.[/cyan]")
+                break
+            except EOFError:
+                console.print()
+                console.print("[cyan]👋 Session ended.[/cyan]")
+                break
+        
+        return 0
 
     def install(
         self,
@@ -1287,6 +1418,422 @@ class CortexCLI:
 
         return 0
 
+    # --- Do Command (manage do-mode runs) ---
+    def do_cmd(self, args: argparse.Namespace) -> int:
+        """Handle `cortex do` commands for managing do-mode runs."""
+        from cortex.do_runner import DoHandler, ProtectedPathsManager, CortexUserManager
+        
+        action = getattr(args, "do_action", None)
+        
+        if not action:
+            cx_print("\n🔧 Do Mode - Execute commands to solve problems\n", "info")
+            console.print("Usage: cortex ask --do <question>")
+            console.print("       cortex do <command> [options]")
+            console.print("\nCommands:")
+            console.print("  history [run_id]        View do-mode run history")
+            console.print("  setup                   Setup cortex user for privilege management")
+            console.print("  protected               Manage protected paths")
+            console.print("\nExample:")
+            console.print("  cortex ask --do 'Fix my nginx configuration'")
+            console.print("  cortex do history")
+            return 0
+        
+        if action == "history":
+            return self._do_history(args)
+        elif action == "setup":
+            return self._do_setup()
+        elif action == "protected":
+            return self._do_protected(args)
+        else:
+            self._print_error(f"Unknown do action: {action}")
+            return 1
+    
+    def _do_history(self, args: argparse.Namespace) -> int:
+        """Show do-mode run history."""
+        from cortex.do_runner import DoHandler
+        
+        handler = DoHandler()
+        run_id = getattr(args, "run_id", None)
+        
+        if run_id:
+            # Show specific run details
+            run = handler.get_run(run_id)
+            if not run:
+                self._print_error(f"Run {run_id} not found")
+                return 1
+            
+            # Get statistics from database
+            stats = handler.db.get_run_stats(run_id)
+            
+            console.print(f"\n[bold]Do Run: {run.run_id}[/bold]")
+            console.print("=" * 70)
+            console.print(f"[bold]Query:[/bold] {run.user_query}")
+            console.print(f"[bold]Mode:[/bold] {run.mode.value}")
+            console.print(f"[bold]Started:[/bold] {run.started_at}")
+            console.print(f"[bold]Completed:[/bold] {run.completed_at}")
+            console.print(f"\n[bold]Summary:[/bold] {run.summary}")
+            
+            # Show statistics
+            if stats:
+                console.print(f"\n[bold cyan]📊 Command Statistics:[/bold cyan]")
+                total = stats.get("total_commands", 0)
+                success = stats.get("successful_commands", 0)
+                failed = stats.get("failed_commands", 0)
+                skipped = stats.get("skipped_commands", 0)
+                console.print(f"   Total: {total} | [green]✓ Success: {success}[/green] | [red]✗ Failed: {failed}[/red] | [yellow]○ Skipped: {skipped}[/yellow]")
+            
+            if run.files_accessed:
+                console.print(f"\n[bold]Files Accessed:[/bold] {', '.join(run.files_accessed)}")
+            
+            # Get detailed commands from database
+            commands_detail = handler.db.get_run_commands(run_id)
+            
+            console.print(f"\n[bold cyan]📋 Commands Executed:[/bold cyan]")
+            console.print("-" * 70)
+            
+            if commands_detail:
+                for cmd in commands_detail:
+                    status = cmd["status"]
+                    if status == "success":
+                        status_icon = "[green]✓[/green]"
+                    elif status == "failed":
+                        status_icon = "[red]✗[/red]"
+                    elif status == "skipped":
+                        status_icon = "[yellow]○[/yellow]"
+                    else:
+                        status_icon = "[dim]?[/dim]"
+                    
+                    console.print(f"\n{status_icon} [bold]Command {cmd['index'] + 1}:[/bold] {cmd['command']}")
+                    console.print(f"   [dim]Purpose:[/dim] {cmd['purpose']}")
+                    console.print(f"   [dim]Status:[/dim] {status} | [dim]Duration:[/dim] {cmd['duration']:.2f}s")
+                    
+                    if cmd["output"]:
+                        console.print(f"   [dim]Output:[/dim] {cmd['output']}")
+                    if cmd["error"]:
+                        console.print(f"   [red]Error:[/red] {cmd['error']}")
+            else:
+                # Fallback to run.commands if database commands not available
+                for i, cmd in enumerate(run.commands):
+                    status_icon = "[green]✓[/green]" if cmd.status.value == "success" else "[red]✗[/red]"
+                    console.print(f"\n{status_icon} [bold]Command {i + 1}:[/bold] {cmd.command}")
+                    console.print(f"   [dim]Purpose:[/dim] {cmd.purpose}")
+                    console.print(f"   [dim]Status:[/dim] {cmd.status.value} | [dim]Duration:[/dim] {cmd.duration_seconds:.2f}s")
+                    if cmd.output:
+                        output_truncated = cmd.output[:250] + "..." if len(cmd.output) > 250 else cmd.output
+                        console.print(f"   [dim]Output:[/dim] {output_truncated}")
+                    if cmd.error:
+                        console.print(f"   [red]Error:[/red] {cmd.error}")
+            
+            return 0
+        
+        # List recent runs
+        limit = getattr(args, "limit", 20)
+        runs = handler.get_run_history(limit)
+        
+        if not runs:
+            cx_print("No do-mode runs found", "info")
+            return 0
+        
+        console.print(f"\n[bold]📜 Recent Do Runs:[/bold]\n")
+        
+        import json as json_module
+        
+        for run in runs:
+            # Get stats from database if available
+            stats = handler.db.get_run_stats(run.run_id)
+            if stats:
+                total = stats.get("total_commands", 0)
+                success = stats.get("successful_commands", 0)
+                failed = stats.get("failed_commands", 0)
+                status_str = f"[green]✓{success}[/green]/[red]✗{failed}[/red]/{total}"
+            else:
+                cmd_count = len(run.commands)
+                success_count = sum(1 for c in run.commands if c.status.value == "success")
+                failed_count = sum(1 for c in run.commands if c.status.value == "failed")
+                status_str = f"[green]✓{success_count}[/green]/[red]✗{failed_count}[/red]/{cmd_count}"
+            
+            # Get commands list from database
+            commands_list = handler.db.get_commands_list(run.run_id)
+            
+            console.print(f"[bold cyan]{'─' * 70}[/bold cyan]")
+            console.print(f"[bold]Run ID:[/bold] {run.run_id}")
+            console.print(f"[bold]Query:[/bold] {run.user_query}")
+            console.print(f"[bold]Mode:[/bold] {run.mode.value} | [bold]Status:[/bold] {status_str} | [bold]Started:[/bold] {run.started_at[:19] if run.started_at else '-'}")
+            console.print(f"[bold]Summary:[/bold] {run.summary}")
+            
+            # Show commands
+            if commands_list:
+                console.print(f"[bold]Commands:[/bold]")
+                for i, cmd in enumerate(commands_list, 1):
+                    cmd_short = cmd[:60] + "..." if len(cmd) > 60 else cmd
+                    console.print(f"   {i}. [cyan]{cmd_short}[/cyan]")
+            console.print()
+        
+        console.print(f"[dim]Use 'cortex do history <run_id>' for full details[/dim]")
+        return 0
+    
+    def _do_setup(self) -> int:
+        """Setup cortex user for privilege management."""
+        from cortex.do_runner import CortexUserManager
+        
+        cx_print("Setting up Cortex user for privilege management...", "info")
+        
+        if CortexUserManager.user_exists():
+            cx_print("✓ Cortex user already exists", "success")
+            return 0
+        
+        success, message = CortexUserManager.create_user()
+        if success:
+            cx_print(f"✓ {message}", "success")
+            return 0
+        else:
+            self._print_error(message)
+            return 1
+    
+    def _do_protected(self, args: argparse.Namespace) -> int:
+        """Manage protected paths."""
+        from cortex.do_runner import ProtectedPathsManager
+        
+        manager = ProtectedPathsManager()
+        
+        add_path = getattr(args, "add", None)
+        remove_path = getattr(args, "remove", None)
+        list_paths = getattr(args, "list", False)
+        
+        if add_path:
+            manager.add_protected_path(add_path)
+            cx_print(f"✓ Added '{add_path}' to protected paths", "success")
+            return 0
+        
+        if remove_path:
+            if manager.remove_protected_path(remove_path):
+                cx_print(f"✓ Removed '{remove_path}' from protected paths", "success")
+            else:
+                self._print_error(f"Path '{remove_path}' not found in user-defined protected paths")
+            return 0
+        
+        # Default: list all protected paths
+        paths = manager.get_all_protected()
+        console.print("\n[bold]Protected Paths:[/bold]")
+        console.print("[dim](These paths require user confirmation for access)[/dim]\n")
+        
+        for path in paths:
+            is_system = path in manager.SYSTEM_PROTECTED_PATHS
+            tag = "[system]" if is_system else "[user]"
+            console.print(f"  {path} [dim]{tag}[/dim]")
+        
+        console.print(f"\n[dim]Total: {len(paths)} paths[/dim]")
+        console.print("[dim]Use --add <path> to add custom paths[/dim]")
+        return 0
+
+    # --- Info Command ---
+    def info_cmd(self, args: argparse.Namespace) -> int:
+        """Get system and application information using read-only commands."""
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        try:
+            from cortex.system_info_generator import (
+                SystemInfoGenerator, 
+                get_system_info_generator,
+                COMMON_INFO_COMMANDS,
+                APP_INFO_TEMPLATES,
+            )
+        except ImportError as e:
+            self._print_error(f"System info generator not available: {e}")
+            return 1
+        
+        debug = getattr(args, "debug", False)
+        
+        # Handle --list
+        if getattr(args, "list", False):
+            console.print("\n[bold]📊 Available Information Types[/bold]\n")
+            
+            console.print("[bold cyan]Quick Info Types (--quick):[/bold cyan]")
+            for name in sorted(COMMON_INFO_COMMANDS.keys()):
+                console.print(f"  • {name}")
+            
+            console.print("\n[bold cyan]Application Templates (--app):[/bold cyan]")
+            for name in sorted(APP_INFO_TEMPLATES.keys()):
+                aspects = ", ".join(APP_INFO_TEMPLATES[name].keys())
+                console.print(f"  • {name}: [dim]{aspects}[/dim]")
+            
+            console.print("\n[bold cyan]Categories (--category):[/bold cyan]")
+            console.print("  hardware, software, network, services, security, storage, performance, configuration")
+            
+            console.print("\n[dim]Examples:[/dim]")
+            console.print("  cortex info --quick cpu")
+            console.print("  cortex info --app nginx")
+            console.print("  cortex info --category hardware")
+            console.print("  cortex info What version of Python is installed?")
+            return 0
+        
+        # Handle --quick
+        quick_type = getattr(args, "quick", None)
+        if quick_type:
+            console.print(f"\n[bold]🔍 Quick Info: {quick_type.upper()}[/bold]\n")
+            
+            if quick_type in COMMON_INFO_COMMANDS:
+                for cmd_info in COMMON_INFO_COMMANDS[quick_type]:
+                    from cortex.ask import CommandValidator
+                    success, stdout, stderr = CommandValidator.execute_command(cmd_info.command)
+                    
+                    if success and stdout:
+                        console.print(Panel(
+                            stdout[:1000] + ("..." if len(stdout) > 1000 else ""),
+                            title=f"[cyan]{cmd_info.purpose}[/cyan]",
+                            subtitle=f"[dim]{cmd_info.command[:60]}...[/dim]" if len(cmd_info.command) > 60 else f"[dim]{cmd_info.command}[/dim]",
+                        ))
+                    elif stderr:
+                        console.print(f"[yellow]⚠ {cmd_info.purpose}: {stderr[:100]}[/yellow]")
+            else:
+                self._print_error(f"Unknown quick info type: {quick_type}")
+                return 1
+            return 0
+        
+        # Handle --app
+        app_name = getattr(args, "app", None)
+        if app_name:
+            console.print(f"\n[bold]📦 Application Info: {app_name.upper()}[/bold]\n")
+            
+            if app_name.lower() in APP_INFO_TEMPLATES:
+                templates = APP_INFO_TEMPLATES[app_name.lower()]
+                for aspect, commands in templates.items():
+                    console.print(f"[bold cyan]─── {aspect.upper()} ───[/bold cyan]")
+                    for cmd_info in commands:
+                        from cortex.ask import CommandValidator
+                        success, stdout, stderr = CommandValidator.execute_command(cmd_info.command, timeout=15)
+                        
+                        if success and stdout:
+                            output = stdout[:500] + ("..." if len(stdout) > 500 else "")
+                            console.print(f"[dim]{cmd_info.purpose}:[/dim]")
+                            console.print(output)
+                        elif stderr:
+                            console.print(f"[yellow]{cmd_info.purpose}: {stderr[:100]}[/yellow]")
+                        console.print()
+            else:
+                # Try using LLM for unknown apps
+                api_key = self._get_api_key()
+                if api_key:
+                    try:
+                        generator = SystemInfoGenerator(
+                            api_key=api_key,
+                            provider=self._get_provider(),
+                            debug=debug,
+                        )
+                        result = generator.get_app_info(app_name)
+                        console.print(result.answer)
+                    except Exception as e:
+                        self._print_error(f"Could not get info for {app_name}: {e}")
+                        return 1
+                else:
+                    self._print_error(f"Unknown app '{app_name}' and no API key for LLM lookup")
+                    return 1
+            return 0
+        
+        # Handle --category
+        category = getattr(args, "category", None)
+        if category:
+            console.print(f"\n[bold]📊 Category Info: {category.upper()}[/bold]\n")
+            
+            api_key = self._get_api_key()
+            if not api_key:
+                # Fall back to running common commands without LLM
+                category_mapping = {
+                    "hardware": ["cpu", "memory", "disk", "gpu"],
+                    "software": ["os", "kernel"],
+                    "network": ["network", "dns"],
+                    "services": ["services"],
+                    "security": ["security"],
+                    "storage": ["disk"],
+                    "performance": ["cpu", "memory", "processes"],
+                    "configuration": ["environment"],
+                }
+                aspects = category_mapping.get(category, [])
+                for aspect in aspects:
+                    if aspect in COMMON_INFO_COMMANDS:
+                        console.print(f"[bold cyan]─── {aspect.upper()} ───[/bold cyan]")
+                        for cmd_info in COMMON_INFO_COMMANDS[aspect]:
+                            from cortex.ask import CommandValidator
+                            success, stdout, _ = CommandValidator.execute_command(cmd_info.command)
+                            if success and stdout:
+                                console.print(stdout[:400])
+                        console.print()
+                return 0
+            
+            try:
+                generator = SystemInfoGenerator(
+                    api_key=api_key,
+                    provider=self._get_provider(),
+                    debug=debug,
+                )
+                result = generator.get_structured_info(category)
+                console.print(result.answer)
+            except Exception as e:
+                self._print_error(f"Could not get category info: {e}")
+                return 1
+            return 0
+        
+        # Handle natural language query
+        query_parts = getattr(args, "query", [])
+        if query_parts:
+            query = " ".join(query_parts)
+            console.print(f"\n[bold]🔍 System Info Query[/bold]\n")
+            console.print(f"[dim]Query: {query}[/dim]\n")
+            
+            api_key = self._get_api_key()
+            if not api_key:
+                self._print_error("Natural language queries require an API key. Use --quick or --app instead.")
+                return 1
+            
+            try:
+                generator = SystemInfoGenerator(
+                    api_key=api_key,
+                    provider=self._get_provider(),
+                    debug=debug,
+                )
+                result = generator.get_info(query)
+                
+                console.print(Panel(result.answer, title="[bold green]Answer[/bold green]"))
+                
+                if debug and result.commands_executed:
+                    table = Table(title="Commands Executed")
+                    table.add_column("Command", style="cyan", max_width=50)
+                    table.add_column("Status", style="green")
+                    table.add_column("Time", style="dim")
+                    for cmd in result.commands_executed:
+                        status = "✓" if cmd.success else "✗"
+                        table.add_row(
+                            cmd.command[:50] + "..." if len(cmd.command) > 50 else cmd.command,
+                            status,
+                            f"{cmd.execution_time:.2f}s"
+                        )
+                    console.print(table)
+                    
+            except Exception as e:
+                self._print_error(f"Query failed: {e}")
+                if debug:
+                    import traceback
+                    traceback.print_exc()
+                return 1
+            return 0
+        
+        # No arguments - show help
+        console.print("\n[bold]📊 Cortex Info - System Information Generator[/bold]\n")
+        console.print("Get system and application information using read-only commands.\n")
+        console.print("[bold cyan]Usage:[/bold cyan]")
+        console.print("  cortex info --list                    List available info types")
+        console.print("  cortex info --quick <type>            Quick lookup (cpu, memory, etc.)")
+        console.print("  cortex info --app <name>              Application info (nginx, docker, etc.)")
+        console.print("  cortex info --category <cat>          Category info (hardware, network, etc.)")
+        console.print("  cortex info <query>                   Natural language query (requires API key)")
+        console.print("\n[bold cyan]Examples:[/bold cyan]")
+        console.print("  cortex info --quick memory")
+        console.print("  cortex info --app nginx")
+        console.print("  cortex info --category hardware")
+        console.print("  cortex info What Python packages are installed?")
+        return 0
+
     # --- Import Dependencies Command ---
     def import_deps(self, args: argparse.Namespace) -> int:
         """Import and install dependencies from package manager files.
@@ -1542,6 +2089,8 @@ def show_rich_help():
     table.add_column("Description")
 
     table.add_row("ask <question>", "Ask about your system")
+    table.add_row("ask --do <question>", "Solve problems (can write/execute)")
+    table.add_row("do history", "View do-mode run history")
     table.add_row("demo", "See Cortex in action")
     table.add_row("wizard", "Configure API key")
     table.add_row("status", "System status")
@@ -1630,8 +2179,13 @@ def main():
 
     # Ask command
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your system")
-    ask_parser.add_argument("question", type=str, help="Natural language question")
+    ask_parser.add_argument("question", type=str, nargs="?", default=None, help="Natural language question (optional with --do)")
     ask_parser.add_argument("--debug", action="store_true", help="Show debug output for agentic loop")
+    ask_parser.add_argument(
+        "--do", 
+        action="store_true", 
+        help="Enable do mode - Cortex can write, read, and execute commands to solve problems. If no question is provided, starts interactive session."
+    )
 
     # Install command
     install_parser = subparsers.add_parser("install", help="Install software")
@@ -1859,6 +2413,56 @@ def main():
     env_template_apply_parser.add_argument(
         "--encrypt-keys", help="Comma-separated list of keys to encrypt"
     )
+    # --- Info Command (system information queries) ---
+    info_parser = subparsers.add_parser("info", help="Get system and application information")
+    info_parser.add_argument("query", nargs="*", help="Information query (natural language)")
+    info_parser.add_argument(
+        "--app", "-a", 
+        type=str, 
+        help="Get info about a specific application (nginx, docker, etc.)"
+    )
+    info_parser.add_argument(
+        "--quick", "-q",
+        type=str,
+        choices=["cpu", "memory", "disk", "gpu", "os", "kernel", "network", "dns", 
+                 "services", "security", "processes", "environment"],
+        help="Quick lookup for common info types"
+    )
+    info_parser.add_argument(
+        "--category", "-c",
+        type=str,
+        choices=["hardware", "software", "network", "services", "security", 
+                 "storage", "performance", "configuration"],
+        help="Get structured info for a category"
+    )
+    info_parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List available info types and applications"
+    )
+    info_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show debug output"
+    )
+
+    # --- Do Command (manage do-mode runs) ---
+    do_parser = subparsers.add_parser("do", help="Manage do-mode execution runs")
+    do_subs = do_parser.add_subparsers(dest="do_action", help="Do actions")
+
+    # do history [--limit N]
+    do_history_parser = do_subs.add_parser("history", help="View do-mode run history")
+    do_history_parser.add_argument("--limit", "-n", type=int, default=20, help="Number of runs to show")
+    do_history_parser.add_argument("run_id", nargs="?", help="Show details for specific run ID")
+
+    # do setup - setup cortex user
+    do_subs.add_parser("setup", help="Setup cortex user for privilege management")
+
+    # do protected - manage protected paths
+    do_protected_parser = do_subs.add_parser("protected", help="Manage protected paths")
+    do_protected_parser.add_argument("--add", help="Add a path to protected list")
+    do_protected_parser.add_argument("--remove", help="Remove a path from protected list")
+    do_protected_parser.add_argument("--list", action="store_true", help="List all protected paths")
     # --------------------------
 
     args = parser.parse_args()
@@ -1877,7 +2481,11 @@ def main():
         elif args.command == "status":
             return cli.status()
         elif args.command == "ask":
-            return cli.ask(args.question, debug=args.debug)
+            return cli.ask(
+                getattr(args, "question", None), 
+                debug=args.debug, 
+                do_mode=getattr(args, "do", False)
+            )
         elif args.command == "install":
             return cli.install(
                 args.software,
@@ -1905,6 +2513,10 @@ def main():
             return 1
         elif args.command == "env":
             return cli.env(args)
+        elif args.command == "do":
+            return cli.do_cmd(args)
+        elif args.command == "info":
+            return cli.info_cmd(args)
         else:
             parser.print_help()
             return 1
