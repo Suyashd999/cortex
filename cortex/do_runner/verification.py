@@ -377,7 +377,80 @@ class ConflictDetector:
                         ]
                     )
         
+        # snap install - check if snap is available and package is installed
+        if "snap install" in cmd:
+            # First check if snap is available
+            snap_available = self._check_tool_available("snap")
+            if not snap_available:
+                return self._create_conflict_result(
+                    resource_type="tool",
+                    resource_name="snap",
+                    conflict_type="tool_not_available",
+                    suggestion="Snap package manager is not installed. Installing snap first.",
+                    is_active=False,
+                    alternative_actions=[
+                        {"action": "install_first", "description": "Install snapd first", "commands": ["sudo apt update", "sudo apt install -y snapd"]},
+                        {"action": "use_apt", "description": "Use apt instead of snap", "commands": []},
+                    ]
+                )
+            
+            pkg_match = re.search(r'snap\s+install\s+(\S+)', cmd)
+            if pkg_match:
+                package = pkg_match.group(1)
+                success, version_out, _ = self._execute_command(f"snap list {package} 2>/dev/null | grep {package}", needs_sudo=False)
+                if success and version_out:
+                    return self._create_conflict_result(
+                        resource_type="snap_package",
+                        resource_name=package,
+                        conflict_type="snap_package_installed",
+                        suggestion=f"Snap package '{package}' is already installed",
+                        is_active=True,
+                        alternative_actions=[
+                            {"action": "use_existing", "description": "Keep current version", "commands": []},
+                            {"action": "refresh", "description": "Refresh to latest", "commands": [f"sudo snap refresh {package}"]},
+                        ]
+                    )
+        
+        # flatpak install - check if flatpak is available and package is installed
+        if "flatpak install" in cmd:
+            # First check if flatpak is available
+            flatpak_available = self._check_tool_available("flatpak")
+            if not flatpak_available:
+                return self._create_conflict_result(
+                    resource_type="tool",
+                    resource_name="flatpak",
+                    conflict_type="tool_not_available",
+                    suggestion="Flatpak is not installed. Installing flatpak first.",
+                    is_active=False,
+                    alternative_actions=[
+                        {"action": "install_first", "description": "Install flatpak first", "commands": ["sudo apt update", "sudo apt install -y flatpak"]},
+                        {"action": "use_apt", "description": "Use apt instead of flatpak", "commands": []},
+                    ]
+                )
+            
+            pkg_match = re.search(r'flatpak\s+install\s+(?:-y\s+)?(\S+)', cmd)
+            if pkg_match:
+                package = pkg_match.group(1)
+                success, version_out, _ = self._execute_command(f"flatpak list | grep -i {package}", needs_sudo=False)
+                if success and version_out:
+                    return self._create_conflict_result(
+                        resource_type="flatpak_package",
+                        resource_name=package,
+                        conflict_type="flatpak_package_installed",
+                        suggestion=f"Flatpak application '{package}' is already installed",
+                        is_active=True,
+                        alternative_actions=[
+                            {"action": "use_existing", "description": "Keep current version", "commands": []},
+                            {"action": "upgrade", "description": "Update to latest", "commands": [f"flatpak update -y {package}"]},
+                        ]
+                    )
+        
         return result
+    
+    def _check_tool_available(self, tool: str) -> bool:
+        """Check if a command-line tool is available."""
+        success, output, _ = self._execute_command(f"which {tool} 2>/dev/null", needs_sudo=False)
+        return success and bool(output.strip())
     
     def _check_port_conflict(self, cmd: str, purpose: str) -> dict[str, Any]:
         """Check for port binding conflicts."""

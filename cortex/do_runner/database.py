@@ -42,6 +42,7 @@ class DoRunDatabase:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS do_runs (
                         run_id TEXT PRIMARY KEY,
+                        session_id TEXT,
                         summary TEXT NOT NULL,
                         commands_log TEXT NOT NULL,
                         commands_list TEXT,
@@ -56,6 +57,17 @@ class DoRunDatabase:
                         successful_commands INTEGER DEFAULT 0,
                         failed_commands INTEGER DEFAULT 0,
                         skipped_commands INTEGER DEFAULT 0
+                    )
+                """)
+                
+                # Create sessions table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS do_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        started_at TEXT,
+                        ended_at TEXT,
+                        total_runs INTEGER DEFAULT 0,
+                        total_queries TEXT
                     )
                 """)
                 
@@ -102,6 +114,7 @@ class DoRunDatabase:
             ("failed_commands", "INTEGER DEFAULT 0"),
             ("skipped_commands", "INTEGER DEFAULT 0"),
             ("commands_list", "TEXT"),
+            ("session_id", "TEXT"),
         ]
         
         for col_name, col_type in new_columns:
@@ -198,12 +211,13 @@ class DoRunDatabase:
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO do_runs 
-                (run_id, summary, commands_log, commands_list, mode, user_query, started_at, 
+                (run_id, session_id, summary, commands_log, commands_list, mode, user_query, started_at, 
                  completed_at, files_accessed, privileges_granted, full_data,
                  total_commands, successful_commands, failed_commands, skipped_commands)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 run.run_id,
+                run.session_id or None,
                 run.summary,
                 commands_log,
                 commands_list,
@@ -256,7 +270,7 @@ class DoRunDatabase:
             
             if row:
                 full_data = json.loads(row["full_data"])
-                return DoRun(
+                run = DoRun(
                     run_id=full_data["run_id"],
                     summary=full_data["summary"],
                     mode=RunMode(full_data["mode"]),
@@ -266,7 +280,9 @@ class DoRunDatabase:
                     user_query=full_data.get("user_query", ""),
                     files_accessed=full_data.get("files_accessed", []),
                     privileges_granted=full_data.get("privileges_granted", []),
+                    session_id=row["session_id"] if "session_id" in row.keys() else "",
                 )
+                return run
         return None
     
     def get_run_commands(self, run_id: str) -> list[dict[str, Any]]:
@@ -346,13 +362,13 @@ class DoRunDatabase:
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                "SELECT full_data FROM do_runs ORDER BY started_at DESC LIMIT ?",
+                "SELECT full_data, session_id FROM do_runs ORDER BY started_at DESC LIMIT ?",
                 (limit,)
             )
             runs = []
             for row in cursor:
                 full_data = json.loads(row["full_data"])
-                runs.append(DoRun(
+                run = DoRun(
                     run_id=full_data["run_id"],
                     summary=full_data["summary"],
                     mode=RunMode(full_data["mode"]),
@@ -362,6 +378,101 @@ class DoRunDatabase:
                     user_query=full_data.get("user_query", ""),
                     files_accessed=full_data.get("files_accessed", []),
                     privileges_granted=full_data.get("privileges_granted", []),
-                ))
+                )
+                run.session_id = row["session_id"]
+                runs.append(run)
             return runs
+    
+    def create_session(self) -> str:
+        """Create a new session and return the session ID."""
+        session_id = f"session_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{hashlib.md5(str(datetime.datetime.now().timestamp()).encode()).hexdigest()[:8]}"
+        
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute(
+                """INSERT INTO do_sessions (session_id, started_at, total_runs, total_queries)
+                   VALUES (?, ?, 0, '[]')""",
+                (session_id, datetime.datetime.now().isoformat())
+            )
+            conn.commit()
+        
+        return session_id
+    
+    def update_session(self, session_id: str, query: str | None = None, increment_runs: bool = False):
+        """Update a session with new query or run count."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            if increment_runs:
+                conn.execute(
+                    "UPDATE do_sessions SET total_runs = total_runs + 1 WHERE session_id = ?",
+                    (session_id,)
+                )
+            
+            if query:
+                # Get current queries
+                cursor = conn.execute(
+                    "SELECT total_queries FROM do_sessions WHERE session_id = ?",
+                    (session_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    queries = json.loads(row[0]) if row[0] else []
+                    queries.append(query)
+                    conn.execute(
+                        "UPDATE do_sessions SET total_queries = ? WHERE session_id = ?",
+                        (json.dumps(queries), session_id)
+                    )
+            
+            conn.commit()
+    
+    def end_session(self, session_id: str):
+        """Mark a session as ended."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE do_sessions SET ended_at = ? WHERE session_id = ?",
+                (datetime.datetime.now().isoformat(), session_id)
+            )
+            conn.commit()
+    
+    def get_session_runs(self, session_id: str) -> list[DoRun]:
+        """Get all runs in a session."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT full_data FROM do_runs WHERE session_id = ? ORDER BY started_at ASC",
+                (session_id,)
+            )
+            runs = []
+            for row in cursor:
+                full_data = json.loads(row["full_data"])
+                run = DoRun(
+                    run_id=full_data["run_id"],
+                    summary=full_data["summary"],
+                    mode=RunMode(full_data["mode"]),
+                    commands=[CommandLog.from_dict(c) for c in full_data["commands"]],
+                    started_at=full_data.get("started_at", ""),
+                    completed_at=full_data.get("completed_at", ""),
+                    user_query=full_data.get("user_query", ""),
+                )
+                run.session_id = session_id
+                runs.append(run)
+            return runs
+    
+    def get_recent_sessions(self, limit: int = 10) -> list[dict]:
+        """Get recent sessions with their run counts."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """SELECT session_id, started_at, ended_at, total_runs, total_queries
+                   FROM do_sessions ORDER BY started_at DESC LIMIT ?""",
+                (limit,)
+            )
+            sessions = []
+            for row in cursor:
+                sessions.append({
+                    "session_id": row["session_id"],
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "total_runs": row["total_runs"],
+                    "queries": json.loads(row["total_queries"]) if row["total_queries"] else [],
+                })
+            return sessions
 

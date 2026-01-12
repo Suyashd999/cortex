@@ -566,9 +566,19 @@ class CortexCLI:
         from rich.panel import Panel
         from rich.prompt import Prompt
         
+        # Create a session
+        from cortex.do_runner import DoRunDatabase
+        db = DoRunDatabase()
+        session_id = db.create_session()
+        
+        # Pass session_id to handler
+        if handler._do_handler:
+            handler._do_handler.current_session_id = session_id
+        
         console.print()
         console.print(Panel(
             "[bold cyan]🚀 Cortex Interactive Session[/bold cyan]\n\n"
+            f"[dim]Session ID: {session_id[:30]}...[/dim]\n\n"
             "Type what you want to do and Cortex will help you.\n"
             "Commands will be shown for approval before execution.\n\n"
             "[dim]Examples:[/dim]\n"
@@ -583,12 +593,13 @@ class CortexCLI:
         console.print()
         
         session_history = []  # Track what was done in this session
+        run_count = 0
         
         while True:
             try:
                 # Show session context if we have history
                 if session_history:
-                    console.print(f"[dim]Session: {len(session_history)} task(s) completed[/dim]")
+                    console.print(f"[dim]Session: {len(session_history)} task(s) | {run_count} run(s)[/dim]")
                 
                 # Get user input
                 query = Prompt.ask("[bold cyan]What would you like to do?[/bold cyan]")
@@ -598,8 +609,9 @@ class CortexCLI:
                 
                 # Check for exit
                 if query.lower().strip() in ["exit", "quit", "bye", "q"]:
+                    db.end_session(session_id)
                     console.print()
-                    console.print("[cyan]👋 Session ended. Run 'cortex do history' to see past runs.[/cyan]")
+                    console.print(f"[cyan]👋 Session ended ({run_count} runs). Run 'cortex do history' to see past runs.[/cyan]")
                     break
                 
                 # Check for help
@@ -620,7 +632,8 @@ class CortexCLI:
                         console.print("[bold]Session history:[/bold]")
                         for i, item in enumerate(session_history, 1):
                             status = "✓" if item.get("success") else "✗"
-                            console.print(f"  {i}. [{status}] {item['query'][:50]}...")
+                            run_info = f" (run: {item.get('run_id', 'N/A')[:15]})" if item.get("run_id") else ""
+                            console.print(f"  {i}. [{status}] {item['query'][:50]}...{run_info}")
                         console.print()
                     else:
                         console.print("[dim]No tasks completed yet.[/dim]")
@@ -632,16 +645,27 @@ class CortexCLI:
                     console.print("[dim]Session history cleared.[/dim]")
                     continue
                 
+                # Update session with query
+                db.update_session(session_id, query=query)
+                
                 # Process the query
                 console.print()
                 try:
                     answer = handler.ask(query)
+                    
+                    # Get the run_id if one was created
+                    run_id = None
+                    if handler._do_handler and handler._do_handler.current_run:
+                        run_id = handler._do_handler.current_run.run_id
+                        run_count += 1
+                        db.update_session(session_id, increment_runs=True)
                     
                     # Track in session history
                     session_history.append({
                         "query": query,
                         "success": True,
                         "answer": answer[:100] if answer else "",
+                        "run_id": run_id,
                     })
                     
                     # Print response if it's informational
@@ -659,10 +683,12 @@ class CortexCLI:
                 console.print()
                 
             except KeyboardInterrupt:
+                db.end_session(session_id)
                 console.print()
                 console.print("[cyan]👋 Session ended.[/cyan]")
                 break
             except EOFError:
+                db.end_session(session_id)
                 console.print()
                 console.print("[cyan]👋 Session ended.[/cyan]")
                 break
@@ -1467,6 +1493,12 @@ class CortexCLI:
             
             console.print(f"\n[bold]Do Run: {run.run_id}[/bold]")
             console.print("=" * 70)
+            
+            # Show session ID if available
+            session_id = getattr(run, "session_id", None)
+            if session_id:
+                console.print(f"[bold]Session:[/bold] [magenta]{session_id}[/magenta]")
+            
             console.print(f"[bold]Query:[/bold] {run.user_query}")
             console.print(f"[bold]Mode:[/bold] {run.mode.value}")
             console.print(f"[bold]Started:[/bold] {run.started_at}")
@@ -1534,43 +1566,72 @@ class CortexCLI:
             cx_print("No do-mode runs found", "info")
             return 0
         
-        console.print(f"\n[bold]📜 Recent Do Runs:[/bold]\n")
+        # Group runs by session
+        sessions = {}
+        standalone_runs = []
+        
+        for run in runs:
+            session_id = getattr(run, "session_id", None)
+            if session_id:
+                if session_id not in sessions:
+                    sessions[session_id] = []
+                sessions[session_id].append(run)
+            else:
+                standalone_runs.append(run)
+        
+        console.print(f"\n[bold]📜 Recent Do Runs:[/bold]")
+        console.print(f"[dim]Sessions: {len(sessions)} | Standalone runs: {len(standalone_runs)}[/dim]\n")
         
         import json as json_module
         
-        for run in runs:
-            # Get stats from database if available
-            stats = handler.db.get_run_stats(run.run_id)
-            if stats:
-                total = stats.get("total_commands", 0)
-                success = stats.get("successful_commands", 0)
-                failed = stats.get("failed_commands", 0)
-                status_str = f"[green]✓{success}[/green]/[red]✗{failed}[/red]/{total}"
-            else:
-                cmd_count = len(run.commands)
-                success_count = sum(1 for c in run.commands if c.status.value == "success")
-                failed_count = sum(1 for c in run.commands if c.status.value == "failed")
-                status_str = f"[green]✓{success_count}[/green]/[red]✗{failed_count}[/red]/{cmd_count}"
+        # Show sessions first
+        for session_id, session_runs in sessions.items():
+            console.print(f"[bold magenta]╭{'─' * 68}╮[/bold magenta]")
+            console.print(f"[bold magenta]│ 📂 Session: {session_id[:40]}...{' ' * 15}│[/bold magenta]")
+            console.print(f"[bold magenta]│    Runs: {len(session_runs)}{' ' * 57}│[/bold magenta]")
+            console.print(f"[bold magenta]╰{'─' * 68}╯[/bold magenta]")
             
-            # Get commands list from database
-            commands_list = handler.db.get_commands_list(run.run_id)
-            
-            console.print(f"[bold cyan]{'─' * 70}[/bold cyan]")
-            console.print(f"[bold]Run ID:[/bold] {run.run_id}")
-            console.print(f"[bold]Query:[/bold] {run.user_query}")
-            console.print(f"[bold]Mode:[/bold] {run.mode.value} | [bold]Status:[/bold] {status_str} | [bold]Started:[/bold] {run.started_at[:19] if run.started_at else '-'}")
-            console.print(f"[bold]Summary:[/bold] {run.summary}")
-            
-            # Show commands
-            if commands_list:
-                console.print(f"[bold]Commands:[/bold]")
-                for i, cmd in enumerate(commands_list, 1):
-                    cmd_short = cmd[:60] + "..." if len(cmd) > 60 else cmd
-                    console.print(f"   {i}. [cyan]{cmd_short}[/cyan]")
+            for run in session_runs:
+                self._display_run_summary(handler, run, indent="   ")
             console.print()
+        
+        # Show standalone runs
+        if standalone_runs:
+            if sessions:
+                console.print(f"[bold cyan]{'─' * 70}[/bold cyan]")
+                console.print("[bold]📋 Standalone Runs (no session):[/bold]")
+            
+            for run in standalone_runs:
+                self._display_run_summary(handler, run)
         
         console.print(f"[dim]Use 'cortex do history <run_id>' for full details[/dim]")
         return 0
+    
+    def _display_run_summary(self, handler, run, indent: str = "") -> None:
+        """Display a single run summary."""
+        stats = handler.db.get_run_stats(run.run_id)
+        if stats:
+            total = stats.get("total_commands", 0)
+            success = stats.get("successful_commands", 0)
+            failed = stats.get("failed_commands", 0)
+            status_str = f"[green]✓{success}[/green]/[red]✗{failed}[/red]/{total}"
+        else:
+            cmd_count = len(run.commands)
+            success_count = sum(1 for c in run.commands if c.status.value == "success")
+            failed_count = sum(1 for c in run.commands if c.status.value == "failed")
+            status_str = f"[green]✓{success_count}[/green]/[red]✗{failed_count}[/red]/{cmd_count}"
+        
+        commands_list = handler.db.get_commands_list(run.run_id)
+        
+        console.print(f"{indent}[bold cyan]{'─' * 60}[/bold cyan]")
+        console.print(f"{indent}[bold]Run ID:[/bold] {run.run_id}")
+        console.print(f"{indent}[bold]Query:[/bold] {run.user_query[:60]}{'...' if len(run.user_query) > 60 else ''}")
+        console.print(f"{indent}[bold]Status:[/bold] {status_str} | [bold]Started:[/bold] {run.started_at[:19] if run.started_at else '-'}")
+        
+        if commands_list and len(commands_list) <= 3:
+            console.print(f"{indent}[bold]Commands:[/bold] {', '.join(cmd[:30] for cmd in commands_list)}")
+        elif commands_list:
+            console.print(f"{indent}[bold]Commands:[/bold] {len(commands_list)} commands")
     
     def _do_setup(self) -> int:
         """Setup cortex user for privilege management."""

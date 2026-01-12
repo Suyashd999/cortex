@@ -49,6 +49,9 @@ class DoHandler:
         
         self._terminal_monitor: TerminalMonitor | None = None
         
+        # Session tracking
+        self.current_session_id: str | None = None
+        
         # Initialize helper classes
         self._diagnoser = ErrorDiagnoser()
         self._auto_fixer = AutoFixer(llm_callback=llm_callback)
@@ -476,6 +479,7 @@ class DoHandler:
             mode=RunMode.CORTEX_EXEC,
             user_query=user_query,
             started_at=datetime.datetime.now().isoformat(),
+            session_id=self.current_session_id or "",
         )
         self.current_run = run
         
@@ -768,6 +772,47 @@ class DoHandler:
                 console.print(f"[cyan]   Will modify existing {resource_type}[/cyan]")
                 # Don't skip - let the original command run to modify
                 return True
+            
+            elif action == "install_first":
+                # Install a missing tool/dependency first
+                console.print(f"[cyan]   Installing required dependency '{resource_name}'...[/cyan]")
+                all_success = True
+                for action_cmd in action_commands:
+                    needs_sudo = action_cmd.startswith("sudo")
+                    success, stdout, stderr = self._execute_single_command(action_cmd, needs_sudo=needs_sudo)
+                    if success:
+                        console.print(f"[green]   ✓ {action_cmd}[/green]")
+                    else:
+                        console.print(f"[red]   ✗ {action_cmd}: {stderr[:50]}[/red]")
+                        all_success = False
+                
+                if all_success:
+                    console.print(f"[green]   ✓ '{resource_name}' installed. Continuing with original command...[/green]")
+                    # Don't skip - run the original command now that the tool is installed
+                    return True
+                else:
+                    console.print(f"[red]   ✗ Failed to install '{resource_name}'[/red]")
+                    commands_to_skip.add(idx)
+                    return True
+            
+            elif action == "use_apt":
+                # User chose to use apt instead of snap
+                console.print(f"[cyan]   Skipping snap command - use apt instead[/cyan]")
+                commands_to_skip.add(idx)
+                return True
+            
+            elif action == "refresh":
+                # Refresh snap package
+                console.print(f"[cyan]   Refreshing snap package...[/cyan]")
+                for action_cmd in action_commands:
+                    needs_sudo = action_cmd.startswith("sudo")
+                    success, _, stderr = self._execute_single_command(action_cmd, needs_sudo=needs_sudo)
+                    if success:
+                        console.print(f"[green]   ✓ {action_cmd}[/green]")
+                    else:
+                        console.print(f"[red]   ✗ {action_cmd}: {stderr[:50]}[/red]")
+                commands_to_skip.add(idx)
+                return True
         
         # No alternatives - use default behavior (add to cleanup if available)
         if conflict.get("cleanup_commands"):
@@ -851,6 +896,7 @@ class DoHandler:
             mode=RunMode.CORTEX_EXEC,
             user_query=user_query,
             started_at=datetime.datetime.now().isoformat(),
+            session_id=self.current_session_id or "",
         )
         self.current_run = run
         self._permission_requests_count = 0
@@ -2218,6 +2264,7 @@ if __name__ == '__main__':
             mode=RunMode.USER_MANUAL,
             user_query=user_query,
             started_at=datetime.datetime.now().isoformat(),
+            session_id=self.current_session_id or "",
         )
         self.current_run = run
         

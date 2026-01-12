@@ -319,6 +319,7 @@ class DoRun:
     user_query: str = ""
     files_accessed: list[str] = field(default_factory=list)
     privileges_granted: list[str] = field(default_factory=list)
+    session_id: str = ""
     
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -331,6 +332,7 @@ class DoRun:
             "user_query": self.user_query,
             "files_accessed": self.files_accessed,
             "privileges_granted": self.privileges_granted,
+            "session_id": self.session_id,
         }
     
     def get_commands_log_string(self) -> str:
