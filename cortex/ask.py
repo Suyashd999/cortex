@@ -228,18 +228,29 @@ class CommandValidator:
         "tee",  # Writes to files
     }
     
-    # Patterns that indicate dangerous operations
+    # Patterns that indicate dangerous operations (NOT including safe chaining)
     DANGEROUS_PATTERNS: list[str] = [
         r">\s*[^|]",           # Output redirection (except pipes)
         r">>\s*",              # Append redirection
         r"<\s*",               # Input redirection  
         r"\$\(",               # Command substitution
         r"`[^`]+`",            # Backtick command substitution
-        r";\s*",               # Command chaining
-        r"&&\s*",              # AND chaining
-        r"\|\|\s*",            # OR chaining
         r"\|.*(?:sh|bash|zsh|exec|eval|xargs)",  # Piping to shell
     ]
+    
+    # Chaining patterns that we'll split instead of block
+    CHAINING_PATTERNS: list[str] = [
+        r";\s*",               # Command chaining
+        r"\s*&&\s*",           # AND chaining
+        r"\s*\|\|\s*",         # OR chaining
+    ]
+    
+    @classmethod
+    def split_chained_commands(cls, command: str) -> list[str]:
+        """Split a chained command into individual commands."""
+        # Split by ;, &&, or ||
+        parts = re.split(r'\s*(?:;|&&|\|\|)\s*', command)
+        return [p.strip() for p in parts if p.strip()]
     
     @classmethod
     def validate_command(cls, command: str) -> tuple[bool, str]:
@@ -256,10 +267,30 @@ class CommandValidator:
         
         command = command.strip()
         
-        # Check for dangerous patterns
+        # Check for dangerous patterns (NOT chaining - we handle that separately)
         for pattern in cls.DANGEROUS_PATTERNS:
             if re.search(pattern, command):
-                return False, f"Command contains blocked pattern (redirections, chaining, or subshells)"
+                return False, f"Command contains blocked pattern (redirections or subshells)"
+        
+        # Check if command has chaining - if so, validate each part
+        has_chaining = any(re.search(p, command) for p in cls.CHAINING_PATTERNS)
+        if has_chaining:
+            subcommands = cls.split_chained_commands(command)
+            for subcmd in subcommands:
+                is_valid, error = cls._validate_single_command(subcmd)
+                if not is_valid:
+                    return False, f"In chained command '{subcmd}': {error}"
+            return True, ""
+        
+        return cls._validate_single_command(command)
+    
+    @classmethod
+    def _validate_single_command(cls, command: str) -> tuple[bool, str]:
+        """Validate a single (non-chained) command."""
+        if not command or not command.strip():
+            return False, "Empty command"
+        
+        command = command.strip()
         
         # Parse the command
         try:
@@ -398,6 +429,9 @@ class CommandValidator:
     def execute_command(cls, command: str, timeout: int = 10) -> tuple[bool, str, str]:
         """Execute a validated command and return the result.
         
+        For chained commands (&&, ||, ;), executes each command separately
+        and combines the output.
+        
         Args:
             command: The shell command to execute
             timeout: Maximum execution time in seconds
@@ -410,6 +444,53 @@ class CommandValidator:
         if not is_valid:
             return False, "", f"Command blocked: {error}"
         
+        # Check if this is a chained command
+        has_chaining = any(re.search(p, command) for p in cls.CHAINING_PATTERNS)
+        
+        if has_chaining:
+            # Split and execute each command separately
+            subcommands = cls.split_chained_commands(command)
+            all_stdout = []
+            all_stderr = []
+            overall_success = True
+            
+            for subcmd in subcommands:
+                try:
+                    result = subprocess.run(
+                        subcmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                    
+                    if result.stdout.strip():
+                        all_stdout.append(f"# {subcmd}\n{result.stdout.strip()}")
+                    if result.stderr.strip():
+                        all_stderr.append(f"# {subcmd}\n{result.stderr.strip()}")
+                    
+                    if result.returncode != 0:
+                        overall_success = False
+                        # For && chaining, stop on first failure
+                        if "&&" in command:
+                            break
+                            
+                except subprocess.TimeoutExpired:
+                    all_stderr.append(f"# {subcmd}\nCommand timed out after {timeout} seconds")
+                    overall_success = False
+                    break
+                except Exception as e:
+                    all_stderr.append(f"# {subcmd}\nExecution failed: {e}")
+                    overall_success = False
+                    break
+            
+            return (
+                overall_success,
+                "\n\n".join(all_stdout),
+                "\n\n".join(all_stderr),
+            )
+        
+        # Single command
         try:
             result = subprocess.run(
                 command,
@@ -477,6 +558,13 @@ class AskHandler:
         else:
             self._console = None
         
+        # For expandable output storage
+        self._last_output: str | None = None
+        self._last_output_command: str | None = None
+        
+        # Interrupt flag - can be set externally to stop execution
+        self._interrupted = False
+        
         # Initialize DoHandler for --do mode
         self._do_handler = None
         if self.do_mode:
@@ -500,6 +588,19 @@ class AskHandler:
 
         self._initialize_client()
 
+    def interrupt(self):
+        """Interrupt the current operation. Call this from signal handlers."""
+        self._interrupted = True
+        # Also interrupt the DoHandler if it exists
+        if self._do_handler:
+            self._do_handler._interrupted = True
+    
+    def reset_interrupt(self):
+        """Reset the interrupt flag before starting a new operation."""
+        self._interrupted = False
+        if self._do_handler:
+            self._do_handler._interrupted = False
+
     def _default_model(self) -> str:
         if self.provider == "openai":
             return "gpt-4o"  # Use gpt-4o for 128K context
@@ -516,6 +617,139 @@ class AskHandler:
         if self.debug and self._console:
             from rich.panel import Panel
             self._console.print(Panel(content, title=f"[bold]{title}[/bold]", style=style))
+    
+    def _print_query_summary(self, question: str, commands_run: list[str], answer: str) -> None:
+        """Print a condensed summary for question queries with improved visual design."""
+        if not self._console:
+            return
+        
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from rich import box
+        
+        # Clean the answer - remove any JSON/shell script that might have leaked
+        clean_answer = answer
+        import re
+        
+        # Check if answer looks like JSON or contains shell script fragments
+        if clean_answer.startswith('{') or '{"' in clean_answer[:100]:
+            # Try to extract just the answer field if present
+            answer_match = re.search(r'"answer"\s*:\s*"([^"]*)"', clean_answer, re.DOTALL)
+            if answer_match:
+                clean_answer = answer_match.group(1)
+                # Unescape common JSON escapes
+                clean_answer = clean_answer.replace('\\n', '\n').replace('\\"', '"')
+        
+        # Remove shell script-like content that shouldn't be in the answer
+        if re.search(r'^(if \[|while |for |echo \$|sed |awk |grep -)', clean_answer, re.MULTILINE):
+            # This looks like shell script leaked - try to extract readable parts
+            readable_lines = []
+            for line in clean_answer.split('\n'):
+                # Keep lines that look like actual content, not script
+                if not re.match(r'^(if \[|fi$|done$|else$|then$|do$|while |for |echo \$|sed |awk )', line.strip()):
+                    if line.strip() and not line.strip().startswith('#!'):
+                        readable_lines.append(line)
+            if readable_lines:
+                clean_answer = '\n'.join(readable_lines[:20])  # Limit to 20 lines
+        
+        self._console.print()
+        
+        # Query section
+        q_display = question[:80] + "..." if len(question) > 80 else question
+        self._console.print(Panel(
+            f"[bold]{q_display}[/bold]",
+            title="[bold white on blue] 🔍 Query [/bold white on blue]",
+            title_align="left",
+            border_style="blue",
+            padding=(0, 1),
+            expand=False,
+        ))
+        
+        # Info gathered section
+        if commands_run:
+            info_table = Table(
+                show_header=False,
+                box=box.SIMPLE,
+                padding=(0, 1),
+                expand=True,
+            )
+            info_table.add_column("", style="dim")
+            
+            for cmd in commands_run[:4]:
+                cmd_display = cmd[:60] + "..." if len(cmd) > 60 else cmd
+                info_table.add_row(f"$ {cmd_display}")
+            if len(commands_run) > 4:
+                info_table.add_row(f"[dim]... and {len(commands_run) - 4} more commands[/dim]")
+            
+            self._console.print(Panel(
+                info_table,
+                title=f"[bold] 📊 Info Gathered ({len(commands_run)} commands) [/bold]",
+                title_align="left",
+                border_style="dim",
+                padding=(0, 0),
+            ))
+        
+        # Answer section - make it prominent
+        if clean_answer.strip():
+            # Truncate very long answers
+            if len(clean_answer) > 800:
+                display_answer = clean_answer[:800] + "\n\n[dim]... (answer truncated)[/dim]"
+            else:
+                display_answer = clean_answer
+            
+            self._console.print(Panel(
+                display_answer,
+                title="[bold white on green] 💡 Answer [/bold white on green]",
+                title_align="left",
+                border_style="green",
+                padding=(1, 2),
+            ))
+    
+    def _show_expandable_output(self, console, output: str, command: str) -> None:
+        """Show output with expand/collapse capability."""
+        from rich.panel import Panel
+        from rich.text import Text
+        
+        lines = output.split('\n')
+        total_lines = len(lines)
+        
+        # Always show first 3 lines as preview
+        preview_count = 3
+        
+        if total_lines <= preview_count + 2:
+            # Small output - just show it all
+            console.print(Panel(
+                output,
+                title=f"[dim]Output[/dim]",
+                title_align="left",
+                border_style="dim",
+                padding=(0, 1),
+            ))
+            return
+        
+        # Show collapsed preview with expand option
+        preview = '\n'.join(lines[:preview_count])
+        remaining = total_lines - preview_count
+        
+        # Build the panel content
+        content = Text()
+        content.append(preview)
+        content.append(f"\n\n[dim]─── {remaining} more lines hidden ───[/dim]", style="dim")
+        
+        console.print(Panel(
+            content,
+            title=f"[dim]Output ({total_lines} lines)[/dim]",
+            subtitle="[dim italic]Type 'e' to expand[/dim italic]",
+            subtitle_align="right",
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        ))
+        
+        # Store for potential expansion
+        self._last_output = output
+        self._last_output_command = command
 
     def _initialize_client(self):
         if self.provider == "openai":
@@ -528,7 +762,11 @@ class AskHandler:
         elif self.provider == "claude":
             try:
                 from anthropic import Anthropic
-
+                import logging
+                # Suppress noisy retry logging from anthropic client
+                logging.getLogger("anthropic").setLevel(logging.WARNING)
+                logging.getLogger("anthropic._base_client").setLevel(logging.WARNING)
+                
                 self.client = Anthropic(api_key=self.api_key)
             except ImportError:
                 raise ImportError("Anthropic package not installed. Run: pip install anthropic")
@@ -547,6 +785,24 @@ class AskHandler:
     
     def _get_read_only_system_prompt(self) -> str:
         return """You are a Linux system assistant that answers questions by executing read-only shell commands.
+
+SCOPE RESTRICTION - VERY IMPORTANT:
+You are ONLY a Linux/system administration assistant. You can ONLY help with:
+- Linux system administration, configuration, and troubleshooting
+- Package management (apt, snap, flatpak, pip, npm, etc.)
+- Service management (systemctl, docker, etc.)
+- File system operations and permissions
+- Networking and security
+- Development environment setup
+- Server configuration
+
+If the user asks about anything unrelated to Linux/technical topics (social chat, personal advice, 
+creative writing, general knowledge questions not related to their system, etc.), you MUST respond with:
+{
+    "response_type": "answer",
+    "answer": "I'm Cortex, a Linux system assistant. I can only help with Linux system administration, package management, and technical tasks on your machine. I can't help with non-technical topics. Is there something I can help you with on your system?",
+    "reasoning": "User query is outside my scope as a Linux system assistant"
+}
 
 Your task is to help answer the user's question about their system by:
 1. Generating shell commands to gather the needed information
@@ -595,6 +851,24 @@ Examples of BLOCKED commands (NEVER use these):
     
     def _get_do_mode_system_prompt(self) -> str:
         return """You are a Linux system assistant that can READ, WRITE, and EXECUTE commands to solve problems.
+
+SCOPE RESTRICTION - VERY IMPORTANT:
+You are ONLY a Linux/system administration assistant. You can ONLY help with:
+- Linux system administration, configuration, and troubleshooting
+- Package management (apt, snap, flatpak, pip, npm, etc.)
+- Service management (systemctl, docker, etc.)
+- File system operations and permissions
+- Networking and security
+- Development environment setup
+- Server configuration
+
+If the user asks about anything unrelated to Linux/technical topics (social chat, personal advice, 
+creative writing, general knowledge questions not related to their system, etc.), you MUST respond with:
+{
+    "response_type": "answer",
+    "answer": "I'm Cortex, a Linux system assistant. I can only help with Linux system administration, package management, and technical tasks on your machine. I can't help with non-technical topics. What would you like me to do on your system?",
+    "reasoning": "User query is outside my scope as a Linux system assistant"
+}
 
 You are in DO MODE - you have the ability to make changes to the system to solve the user's problem.
 
@@ -806,6 +1080,73 @@ Examples of REPAIR commands after failures:
         prompt += "\nRespond with a JSON object as specified in the system prompt."
         return prompt
 
+    def _clean_llm_response(self, text: str) -> str:
+        """Clean raw LLM response to prevent JSON from being displayed to user.
+        
+        Extracts meaningful content like reasoning or answer from raw JSON,
+        or returns a generic error message if the response is pure JSON.
+        
+        NOTE: This is only called as a fallback when JSON parsing fails.
+        We should NOT return placeholder messages for valid response types.
+        """
+        import re
+        
+        # If it looks like pure JSON, don't show it to user
+        text = text.strip()
+        
+        # Check for partial JSON (starts with ], }, or other JSON fragments)
+        if text.startswith((']', '},', ',"', '"response_type"', '"do_commands"', '"command"', '"reasoning"')):
+            return ""  # Return empty so loop continues
+        
+        if text.startswith('{') and text.endswith('}'):
+            # Try to extract useful fields
+            try:
+                data = json.loads(text)
+                # Try to get meaningful content in order of preference
+                if data.get("answer"):
+                    return data["answer"]
+                if data.get("reasoning") and data.get("response_type") == "answer":
+                    # Only use reasoning if it's an answer type
+                    reasoning = data["reasoning"]
+                    if not any(p in reasoning for p in ['"command":', '"do_commands":', '"requires_sudo":']):
+                        return f"Analysis: {reasoning}"
+                # For do_commands or command types, return empty to let parsing retry
+                if data.get("do_commands") or data.get("command"):
+                    return ""  # Return empty so the proper parsing can happen
+                # Pure JSON with no useful fields
+                return ""
+            except json.JSONDecodeError:
+                pass
+        
+        # Check for JSON-like patterns in the text
+        json_patterns = [
+            r'"response_type"\s*:\s*"',
+            r'"do_commands"\s*:\s*\[',
+            r'"command"\s*:\s*"',
+            r'"requires_sudo"\s*:\s*',
+            r'\[\s*\{',  # Start of array of objects
+            r'\}\s*,\s*\{',  # Object separator
+            r'\]\s*,\s*"',  # End of array followed by key
+        ]
+        
+        # If text contains raw JSON patterns, try to extract non-JSON parts
+        has_json_patterns = any(re.search(p, text) for p in json_patterns)
+        if has_json_patterns:
+            # Try to find text before or after JSON
+            parts = re.split(r'\{[\s\S]*"response_type"[\s\S]*\}', text)
+            clean_parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 20]
+            if clean_parts:
+                # Filter out parts that still look like JSON
+                clean_parts = [p for p in clean_parts if not any(j in p for j in ['":', '",', '{}', '[]'])]
+                if clean_parts:
+                    return " ".join(clean_parts)
+            
+            # No good text found, return generic message
+            return "I'm processing your request. Please wait for the proper output."
+        
+        # Text doesn't look like JSON, return as-is
+        return text
+
     def _parse_llm_response(self, response_text: str) -> SystemCommand:
         """Parse the LLM response into a SystemCommand object."""
         # Try to extract JSON from the response
@@ -847,17 +1188,19 @@ Examples of REPAIR commands after failures:
                     
                     data = json.loads(json_str)
                 except json.JSONDecodeError:
-                    # If still fails, treat as direct answer
+                    # If still fails, don't show raw JSON to user
+                    clean_answer = self._clean_llm_response(original_text)
                     return SystemCommand(
                         response_type=LLMResponseType.ANSWER,
-                        answer=original_text,
+                        answer=clean_answer,
                         reasoning="Could not parse structured response, treating as direct answer"
                     )
             else:
-                # No JSON found, treat as direct answer
+                # No JSON found, clean up before treating as direct answer
+                clean_answer = self._clean_llm_response(original_text)
                 return SystemCommand(
                     response_type=LLMResponseType.ANSWER,
-                    answer=original_text,
+                    answer=clean_answer,
                     reasoning="No JSON structure found, treating as direct answer"
                 )
         
@@ -871,15 +1214,20 @@ Examples of REPAIR commands after failures:
             
             return SystemCommand(**data)
         except Exception as e:
-            # If SystemCommand creation fails, treat it as a direct answer
+            # If SystemCommand creation fails, don't show raw JSON to user
+            clean_answer = self._clean_llm_response(original_text)
             return SystemCommand(
                 response_type=LLMResponseType.ANSWER,
-                answer=original_text,
+                answer=clean_answer,
                 reasoning=f"Failed to create SystemCommand: {e}"
             )
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """Call the LLM and return the response text."""
+        # Check for interrupt before making API call
+        if self._interrupted:
+            raise InterruptedError("Operation interrupted by user")
+        
         if self.provider == "openai":
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -964,6 +1312,15 @@ Examples of REPAIR commands after failures:
         
         system_prompt = """You are a Linux system assistant in an interactive session.
 The user has just completed some tasks and now wants to do something else.
+
+SCOPE RESTRICTION:
+You can ONLY help with Linux/technical topics. If the user asks about anything unrelated 
+(social chat, personal advice, general knowledge, etc.), respond with:
+{
+    "response_type": "answer",
+    "answer": "I'm Cortex, a Linux system assistant. I can only help with Linux system administration and technical tasks. What would you like me to do on your system?",
+    "reasoning": "User query is outside my scope"
+}
 
 Based on their request, decide what to do:
 1. If they want to EXECUTE commands (install, configure, start, etc.), respond with do_commands
@@ -1088,6 +1445,11 @@ For running a read-only command:
         loop_console = Console()
         
         for iteration in range(max_iterations):
+            # Check for interrupt at start of each iteration
+            if self._interrupted:
+                self._interrupted = False  # Reset for next request
+                return "Operation interrupted by user."
+            
             if self.debug:
                 self._debug_print(
                     f"Iteration {iteration + 1}/{max_iterations}",
@@ -1097,7 +1459,14 @@ For running a read-only command:
             
             # Show progress to user (even without --debug)
             if self.do_mode and iteration > 0:
-                loop_console.print(f"[dim]🔄 Analyzing results... (step {iteration + 1}/{max_iterations})[/dim]")
+                from rich.panel import Panel
+                loop_console.print()
+                loop_console.print(Panel(
+                    f"[bold cyan]Analyzing results...[/bold cyan]  [dim]Step {iteration + 1}[/dim]",
+                    border_style="dim cyan",
+                    padding=(0, 1),
+                    expand=False,
+                ))
             
             # Build prompt with history
             user_prompt = self._build_iteration_prompt(question, history)
@@ -1105,7 +1474,18 @@ For running a read-only command:
             # Call LLM
             try:
                 response_text = self._call_llm(system_prompt, user_prompt)
+                # Check for interrupt after LLM call
+                if self._interrupted:
+                    self._interrupted = False
+                    return "Operation interrupted by user."
+            except InterruptedError:
+                # Explicitly interrupted
+                self._interrupted = False
+                return "Operation interrupted by user."
             except Exception as e:
+                if self._interrupted:
+                    self._interrupted = False
+                    return "Operation interrupted by user."
                 raise RuntimeError(f"LLM API call failed: {str(e)}")
             
             if self.debug:
@@ -1127,14 +1507,36 @@ For running a read-only command:
             
             # Show what the LLM decided to do
             if self.do_mode and not self.debug:
-                if parsed.response_type == LLMResponseType.COMMAND:
-                    loop_console.print(f"[cyan]🔍 Gathering info:[/cyan] {parsed.command}")
-                elif parsed.response_type == LLMResponseType.DO_COMMANDS:
-                    loop_console.print(f"[cyan]📋 Ready to execute {len(parsed.do_commands or [])} command(s)[/cyan]")
+                from rich.panel import Panel
+                if parsed.response_type == LLMResponseType.COMMAND and parsed.command:
+                    loop_console.print(Panel(
+                        f"[bold]🔍 Gathering info[/bold]\n[cyan]{parsed.command}[/cyan]",
+                        border_style="blue",
+                        padding=(0, 1),
+                        expand=False,
+                    ))
+                elif parsed.response_type == LLMResponseType.DO_COMMANDS and parsed.do_commands:
+                    loop_console.print(Panel(
+                        f"[bold green]📋 Ready to execute[/bold green] [white]{len(parsed.do_commands)} command(s)[/white]",
+                        border_style="green",
+                        padding=(0, 1),
+                        expand=False,
+                    ))
+                elif parsed.response_type == LLMResponseType.ANSWER and parsed.answer:
+                    pass  # Will be handled below
+                else:
+                    # LLM returned an unexpected or empty response
+                    loop_console.print(f"[dim yellow]⏳ Waiting for LLM to propose commands...[/dim yellow]")
             
             # If LLM provides a final answer, return it
             if parsed.response_type == LLMResponseType.ANSWER:
-                answer = parsed.answer or "Unable to determine an answer."
+                answer = parsed.answer or ""
+                
+                # Skip empty answers (parsing fallback that should continue loop)
+                if not answer.strip():
+                    if self.do_mode:
+                        loop_console.print(f"[dim]   (waiting for LLM to propose commands...)[/dim]")
+                    continue
                 
                 if self.debug:
                     self._debug_print("Final Answer", answer, style="green")
@@ -1152,21 +1554,25 @@ For running a read-only command:
                     except (OSError, sqlite3.Error):
                         pass
                 
+                # Print condensed summary for questions
+                self._print_query_summary(question, tried_commands, answer)
+                
                 return answer
             
             # Handle do_commands in --do mode
             if parsed.response_type == LLMResponseType.DO_COMMANDS and self.do_mode:
+                if not parsed.do_commands:
+                    # LLM said do_commands but provided none - ask it to try again
+                    loop_console.print(f"[yellow]⚠ LLM response incomplete, retrying...[/yellow]")
+                    history.append({
+                        "type": "error",
+                        "message": "Response contained no commands. Please provide specific commands to execute.",
+                    })
+                    continue
+                    
                 result = self._handle_do_commands(parsed, question, history)
                 if result is not None:
-                    # If user declined, continue the loop to provide manual instructions
-                    if result.startswith("USER_DECLINED:"):
-                        # Add to history that user declined
-                        history.append({
-                            "type": "do_commands_declined",
-                            "commands": [(c.command, c.purpose) for c in (parsed.do_commands or [])],
-                            "message": "User declined automatic execution. Manual instructions were provided.",
-                        })
-                        continue
+                    # Result is either a completion message or None (continue loop)
                     return result
             
             # LLM wants to execute a read-only command
@@ -1180,11 +1586,15 @@ For running a read-only command:
                 # Validate and execute the command
                 success, stdout, stderr = CommandValidator.execute_command(command)
                 
-                # Show execution result to user
+                # Show execution result to user with expandable output
                 if self.do_mode and not self.debug:
                     if success:
                         output_lines = len(stdout.split('\n')) if stdout else 0
                         loop_console.print(f"[green]   ✓ Got {output_lines} lines of output[/green]")
+                        
+                        # Show expandable output
+                        if stdout and output_lines > 0:
+                            self._show_expandable_output(loop_console, stdout, command)
                     else:
                         loop_console.print(f"[yellow]   ⚠ Command failed: {stderr[:100]}[/yellow]")
                 
@@ -1201,10 +1611,27 @@ For running a read-only command:
                     "output": stdout if success else "",
                     "error": stderr if not success else "",
                 })
+                continue  # Continue to next iteration with new info
+            
+            # If we get here, no valid action was taken
+            # This means LLM returned something we couldn't use
+            if self.do_mode and not self.debug:
+                if parsed.reasoning:
+                    # Show reasoning if available
+                    loop_console.print(f"[dim]   LLM: {parsed.reasoning[:100]}{'...' if len(parsed.reasoning) > 100 else ''}[/dim]")
         
         # Max iterations reached
-        commands_list = "\n".join(f"  - {cmd}" for cmd in tried_commands)
-        result = f"Could not find an answer after {max_iterations} attempts.\n\nTried commands:\n{commands_list}"
+        if self.do_mode:
+            if tried_commands:
+                commands_list = "\n".join(f"  - {cmd}" for cmd in tried_commands)
+                result = f"The LLM gathered information but didn't propose any commands to execute.\n\nInfo gathered with:\n{commands_list}\n\nTry being more specific about what you want to do."
+            else:
+                result = "The LLM couldn't determine what commands to run. Try rephrasing your request with more specific details."
+            
+            loop_console.print(f"[yellow]⚠ {result}[/yellow]")
+        else:
+            commands_list = "\n".join(f"  - {cmd}" for cmd in tried_commands)
+            result = f"Could not find an answer after {max_iterations} attempts.\n\nTried commands:\n{commands_list}"
         
         if self.debug:
             self._debug_print("Max Iterations Reached", result, style="red")
@@ -1268,7 +1695,16 @@ For running a read-only command:
                     "output": cmd_log.output,
                     "error": cmd_log.error,
                     "purpose": cmd_log.purpose,
-                    "executed_by": "cortex",
+                    "executed_by": "cortex" if "Manual execution" not in (cmd_log.purpose or "") else "user_manual",
+                })
+            
+            # Check if any commands were completed manually during execution
+            manual_completed = self._do_handler.get_completed_manual_commands()
+            if manual_completed:
+                history.append({
+                    "type": "commands_completed_manually",
+                    "commands": manual_completed,
+                    "message": f"User manually executed these commands successfully: {', '.join(manual_completed)}. Do NOT re-propose them.",
                 })
             
             # Check if there were failures that need LLM input
@@ -1292,11 +1728,95 @@ For running a read-only command:
                 # Continue loop so LLM can suggest next steps
                 return None
             
+            # All commands succeeded (automatically or manually)
+            successes = [c for c in run.commands if c.status.value == "success"]
+            if successes and not failures:
+                # Everything worked - return success message
+                summary = run.summary or f"Successfully executed {len(successes)} command(s)"
+                return f"✅ {summary}"
+            
             # Return summary for now - LLM will provide final answer in next iteration
             return None
         else:
-            # User declined - provide manual instructions with monitoring
+            # User declined automatic execution - provide manual instructions with monitoring
             run = self._do_handler.provide_manual_instructions(analyzed, question)
             
-            # Return special marker so we continue the loop
-            return f"USER_DECLINED: Manual instructions provided. Run ID: {run.run_id}"
+            # Check if any commands were completed manually
+            manual_completed = self._do_handler.get_completed_manual_commands()
+            
+            # Check success/failure status from the run
+            from cortex.do_runner.models import CommandStatus
+            successful_count = sum(1 for c in run.commands if c.status == CommandStatus.SUCCESS)
+            failed_count = sum(1 for c in run.commands if c.status == CommandStatus.FAILED)
+            total_expected = len(analyzed)
+            
+            if manual_completed and successful_count > 0:
+                # Commands were completed successfully - go to end
+                history.append({
+                    "type": "commands_completed_manually",
+                    "commands": manual_completed,
+                    "message": f"User manually executed {successful_count} commands successfully.",
+                })
+                return f"✅ Commands completed manually. {successful_count} succeeded."
+            
+            # Commands were NOT all successful - ask user what they want to do
+            console.print()
+            from rich.panel import Panel
+            from rich.prompt import Prompt
+            
+            status_msg = []
+            if successful_count > 0:
+                status_msg.append(f"[green]✓ {successful_count} succeeded[/green]")
+            if failed_count > 0:
+                status_msg.append(f"[red]✗ {failed_count} failed[/red]")
+            remaining = total_expected - successful_count - failed_count
+            if remaining > 0:
+                status_msg.append(f"[yellow]○ {remaining} not executed[/yellow]")
+            
+            console.print(Panel(
+                " | ".join(status_msg) if status_msg else "[yellow]No commands were executed[/yellow]",
+                title="[bold] Manual Intervention Result [/bold]",
+                border_style="yellow",
+                padding=(0, 1),
+            ))
+            
+            console.print()
+            console.print("[bold]What would you like to do?[/bold]")
+            console.print("[dim]  • Type your request to retry or modify the approach[/dim]")
+            console.print("[dim]  • Say 'done', 'no', or 'skip' to finish without retrying[/dim]")
+            console.print()
+            
+            try:
+                user_response = Prompt.ask("[cyan]Your response[/cyan]").strip()
+            except (EOFError, KeyboardInterrupt):
+                user_response = "done"
+            
+            # Check if user wants to end
+            end_keywords = ["done", "no", "skip", "exit", "quit", "stop", "cancel", "n", "finish", "end"]
+            if user_response.lower() in end_keywords or not user_response:
+                # User doesn't want to retry - go to end
+                history.append({
+                    "type": "manual_intervention_ended",
+                    "message": f"User ended manual intervention. {successful_count} commands succeeded.",
+                })
+                if successful_count > 0:
+                    return f"✅ Session ended. {successful_count} command(s) completed successfully."
+                else:
+                    return f"Session ended. No commands were executed."
+            
+            # User wants to retry or modify - add their input to history
+            history.append({
+                "type": "manual_intervention_feedback",
+                "user_input": user_response,
+                "previous_commands": [(cmd, purpose, []) for cmd, purpose, _ in analyzed],
+                "successful_count": successful_count,
+                "failed_count": failed_count,
+                "message": f"User requested: {user_response}. Previous attempt had {successful_count} successes and {failed_count} failures.",
+            })
+            
+            console.print()
+            console.print(f"[cyan]🔄 Processing your request: {user_response[:50]}{'...' if len(user_response) > 50 else ''}[/cyan]")
+            
+            # Continue the loop with user's new input as additional context
+            # The LLM will see the history and the user's feedback
+            return None

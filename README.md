@@ -120,6 +120,61 @@ cortex install nginx --dry-run
 cortex install nginx --execute
 ```
 
+### AI Command Execution Setup (`ask --do`)
+
+For the full AI-powered command execution experience, run the setup script:
+
+```bash
+# Full setup (Ollama + Watch Service + Shell Hooks)
+./scripts/setup_ask_do.sh
+
+# Or use Python directly
+python scripts/setup_ask_do.py
+
+# Options:
+#   --no-docker     Skip Docker/Ollama setup (use cloud LLM only)
+#   --model phi     Use a smaller model (2GB instead of 4GB)
+#   --skip-watch    Skip watch service installation
+#   --uninstall     Remove all components
+```
+
+This script will:
+1. **Set up Ollama** with a local LLM (Mistral by default) in Docker
+2. **Install the Watch Service** for terminal monitoring
+3. **Configure Shell Hooks** for command logging
+4. **Verify everything works**
+
+#### Quick Start After Setup
+
+```bash
+# Start an interactive AI session
+cortex ask --do
+
+# Or with a specific task
+cortex ask --do "install nginx and configure it for reverse proxy"
+
+# Check watch service status
+cortex watch --status
+```
+
+#### Manual Setup (Alternative)
+
+If you prefer manual setup:
+
+```bash
+# Install the Cortex Watch service (runs automatically on login)
+cortex watch --install --service
+
+# Check status
+cortex watch --status
+
+# For Ollama (optional - for local LLM)
+docker run -d --name ollama -p 11434:11434 -v ollama:/root/.ollama ollama/ollama
+docker exec ollama ollama pull mistral
+```
+
+This enables Cortex to monitor your terminal activity during manual intervention mode, providing real-time AI feedback and error detection.
+
 ---
 
 ## Usage
@@ -145,9 +200,13 @@ cortex rollback <installation-id>
 | `cortex install <query>` | Install packages matching natural language query |
 | `cortex install <query> --dry-run` | Preview installation plan (default) |
 | `cortex install <query> --execute` | Execute the installation |
+| `cortex ask <question>` | Ask questions about your system |
+| `cortex ask --do` | Interactive AI command execution mode |
 | `cortex sandbox <cmd>` | Test packages in Docker sandbox |
 | `cortex history` | View all past installations |
 | `cortex rollback <id>` | Undo a specific installation |
+| `cortex watch --install --service` | Install terminal monitoring service |
+| `cortex watch --status` | Check terminal monitoring status |
 | `cortex --version` | Show version information |
 | `cortex --help` | Display help message |
 
@@ -157,9 +216,11 @@ Cortex stores configuration in `~/.cortex/`:
 
 ```
 ~/.cortex/
-├── config.yaml      # User preferences
-├── history.db       # Installation history (SQLite)
-└── audit.log        # Detailed audit trail
+├── config.yaml           # User preferences
+├── history.db            # Installation history (SQLite)
+├── audit.log             # Detailed audit trail
+├── terminal_watch.log    # Terminal monitoring log
+└── watch_service.log     # Watch service logs
 ```
 
 ---
@@ -216,16 +277,27 @@ Cortex stores configuration in `~/.cortex/`:
 cortex/
 ├── cortex/                 # Main package
 │   ├── cli.py              # Command-line interface
+│   ├── ask.py              # AI Q&A and command execution
 │   ├── coordinator.py      # Installation orchestration
 │   ├── llm_router.py       # Multi-LLM routing
 │   ├── packages.py         # Package manager wrapper
 │   ├── hardware_detection.py
 │   ├── installation_history.py
+│   ├── watch_service.py    # Terminal monitoring service
+│   ├── do_runner/          # AI command execution
+│   │   ├── handler.py      # Main execution handler
+│   │   ├── terminal.py     # Terminal monitoring
+│   │   ├── diagnosis.py    # Error diagnosis & auto-fix
+│   │   └── verification.py # Conflict detection
 │   └── utils/              # Utility modules
 ├── tests/                  # Test suite
 ├── docs/                   # Documentation
+│   └── ASK_DO_ARCHITECTURE.md  # ask --do deep dive
 ├── examples/               # Example scripts
 └── scripts/                # Utility scripts
+    ├── setup_ask_do.py     # Full ask --do setup
+    ├── setup_ask_do.sh     # Bash setup alternative
+    └── setup_ollama.py     # Ollama-only setup
 ```
 
 ---

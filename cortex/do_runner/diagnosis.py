@@ -767,6 +767,13 @@ UBUNTU_PACKAGE_MAP = {
     "awk": "gawk", "sed": "sed", "grep": "grep",
     "setfacl": "acl", "getfacl": "acl",
     "lsof": "lsof", "strace": "strace",
+    # System monitoring tools
+    "sensors": "lm-sensors", "sensors-detect": "lm-sensors",
+    "htop": "htop", "iotop": "iotop", "iftop": "iftop",
+    "nmap": "nmap", "netstat": "net-tools", "ifconfig": "net-tools",
+    "smartctl": "smartmontools", "hdparm": "hdparm",
+    # Optional tools (may not be in all repos)
+    "snap": "snapd", "flatpak": "flatpak",
 }
 
 UBUNTU_SERVICE_MAP = {
@@ -1106,10 +1113,35 @@ class ErrorDiagnoser:
         elif strategy == "check_service_logs":
             service = extracted.get("service")
             if service:
-                diagnosis["fix_commands"] = [
-                    f"sudo journalctl -u {service} -n 50 --no-pager",
-                    f"sudo systemctl status {service}"
-                ]
+                # For web servers, check for port conflicts and common issues
+                if service in ("apache2", "httpd", "nginx"):
+                    diagnosis["fix_commands"] = [
+                        # First check what's using port 80
+                        "sudo lsof -i :80 -t | head -1",
+                        # Stop conflicting services
+                        "sudo systemctl stop nginx 2>/dev/null || true",
+                        "sudo systemctl stop apache2 2>/dev/null || true",
+                        # Test config
+                        f"sudo {'apache2ctl' if service == 'apache2' else 'nginx'} -t 2>&1 || true",
+                        # Now try starting
+                        f"sudo systemctl start {service}",
+                    ]
+                elif service in ("mysql", "mariadb", "postgresql", "postgres"):
+                    diagnosis["fix_commands"] = [
+                        # Check disk space
+                        "df -h /var/lib 2>/dev/null | tail -1",
+                        # Check permissions
+                        f"sudo chown -R {'mysql:mysql' if 'mysql' in service or 'mariadb' in service else 'postgres:postgres'} /var/lib/{'mysql' if 'mysql' in service or 'mariadb' in service else 'postgresql'} 2>/dev/null || true",
+                        # Restart
+                        f"sudo systemctl start {service}",
+                    ]
+                else:
+                    # Generic service - check logs and try restart
+                    diagnosis["fix_commands"] = [
+                        f"sudo journalctl -u {service} -n 20 --no-pager 2>&1 | tail -10",
+                        f"sudo systemctl reset-failed {service} 2>/dev/null || true",
+                        f"sudo systemctl start {service}",
+                    ]
         
         elif strategy == "unmask_service":
             service = extracted.get("service")
@@ -2091,6 +2123,8 @@ Example response:
     
     def _execute_command(self, cmd: str, needs_sudo: bool = False, timeout: int = 120) -> tuple[bool, str, str]:
         """Execute a single command."""
+        import sys
+        
         try:
             if needs_sudo and not cmd.strip().startswith("sudo"):
                 cmd = f"sudo {cmd}"
@@ -2099,6 +2133,14 @@ Example response:
             if cmd.strip().startswith("#"):
                 return True, "", ""
             
+            # For sudo commands, we need to handle the password prompt specially
+            is_sudo = cmd.strip().startswith("sudo")
+            
+            if is_sudo:
+                # Flush output before sudo to ensure clean state
+                sys.stdout.flush()
+                sys.stderr.flush()
+            
             result = subprocess.run(
                 cmd,
                 shell=True,
@@ -2106,6 +2148,13 @@ Example response:
                 text=True,
                 timeout=timeout,
             )
+            
+            if is_sudo:
+                # After sudo, ensure console is in clean state
+                # Print empty line to reset cursor position after potential password prompt
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+            
             return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
         except subprocess.TimeoutExpired:
             return False, "", f"Command timed out after {timeout} seconds"
@@ -2181,10 +2230,34 @@ Example response:
             skipped_attempts = 0
             
             severity = current_diagnosis.get("severity", "error")
-            if severity == "critical":
-                console.print(f"[red]⚠️  Critical error: {error_type}[/red]")
             
-            console.print(f"[cyan]🔧 Auto-fix attempt {attempt}/{max_attempts}: [{category}] {error_type}[/cyan]")
+            # Visual grouping for auto-fix attempts
+            from rich.panel import Panel
+            from rich.text import Text
+            
+            fix_title = Text()
+            fix_title.append("🔧 AUTO-FIX ", style="bold yellow")
+            fix_title.append(f"Attempt {attempt}/{max_attempts}", style="dim")
+            
+            severity_color = "red" if severity == "critical" else "yellow"
+            fix_content = Text()
+            if severity == "critical":
+                fix_content.append("⚠️  CRITICAL: ", style="bold red")
+            fix_content.append(f"[{category}] ", style="dim")
+            fix_content.append(error_type, style=f"bold {severity_color}")
+            
+            console.print()
+            console.print(Panel(
+                fix_content,
+                title=fix_title,
+                title_align="left",
+                border_style=severity_color,
+                padding=(0, 1),
+            ))
+            
+            # Ensure output is flushed before executing fixes
+            import sys
+            sys.stdout.flush()
             
             fixed, message, commands = self.apply_single_fix(cmd, current_stderr, current_diagnosis)
             
@@ -2209,7 +2282,12 @@ Example response:
                     all_commands_executed.append(sudo_cmd)
                     
                     if success:
-                        console.print(f"[green]   ✓ Fixed with sudo[/green]")
+                        console.print(Panel(
+                            "[bold green]✓ Fixed with sudo[/bold green]",
+                            border_style="green",
+                            padding=(0, 1),
+                            expand=False,
+                        ))
                         return True, f"Fixed with sudo after {attempt} attempt(s)", all_commands_executed
                     else:
                         current_stderr = new_stderr
@@ -2217,28 +2295,38 @@ Example response:
                         continue
                 
                 # Verify the original command now works
-                console.print(f"[cyan]   ✓ Fix applied: {message}[/cyan]")
-                console.print(f"[cyan]   Verifying original command...[/cyan]")
+                console.print(Panel(
+                    f"[bold cyan]✓ Fix applied:[/bold cyan] {message}\n[dim]Verifying original command...[/dim]",
+                    border_style="cyan",
+                    padding=(0, 1),
+                    expand=False,
+                ))
                 
                 verify_cmd = f"sudo {cmd}" if not cmd.startswith("sudo") else cmd
                 success, stdout, new_stderr = self._execute_command(verify_cmd)
                 all_commands_executed.append(verify_cmd)
                 
                 if success:
-                    console.print(f"[green]   ✓ Verified! Command now succeeds[/green]")
+                    console.print(Panel(
+                        "[bold green]✓ Verified![/bold green] Command now succeeds",
+                        border_style="green",
+                        padding=(0, 1),
+                        expand=False,
+                    ))
                     return True, f"Fixed after {attempt} attempt(s): {message}", all_commands_executed
                 else:
                     new_diagnosis = self.diagnoser.diagnose_error(cmd, new_stderr)
                     
                     if new_diagnosis["error_type"] == error_type:
-                        console.print(f"[yellow]   Same error persists, trying different approach...[/yellow]")
+                        console.print(f"   [dim yellow]Same error persists, trying different approach...[/dim yellow]")
                     else:
-                        console.print(f"[yellow]   New error: {new_diagnosis['error_type']}[/yellow]")
+                        console.print(f"   [yellow]New error: {new_diagnosis['error_type']}[/yellow]")
                     
                     current_stderr = new_stderr
                     current_diagnosis = new_diagnosis
             else:
-                console.print(f"[yellow]   Fix attempt failed: {message}[/yellow]")
+                console.print(f"   [dim red]Fix attempt failed: {message}[/dim red]")
+                console.print(f"   [dim]Trying fallback...[/dim]")
                 
                 # Try with sudo as fallback
                 sudo_fallback = f"sudo {cmd}"

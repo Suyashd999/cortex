@@ -3,8 +3,11 @@
 import datetime
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from rich.console import Console
@@ -49,6 +52,10 @@ class DoHandler:
         
         self._terminal_monitor: TerminalMonitor | None = None
         
+        # Manual intervention tracking
+        self._expected_manual_commands: list[str] = []
+        self._completed_manual_commands: list[str] = []
+        
         # Session tracking
         self.current_session_id: str | None = None
         
@@ -59,6 +66,167 @@ class DoHandler:
         self._conflict_detector = ConflictDetector()
         self._verification_runner = VerificationRunner()
         self._file_analyzer = FileUsefulnessAnalyzer()
+        
+        # Execution state tracking for interruption handling
+        self._current_process: subprocess.Popen | None = None
+        self._current_command: str | None = None
+        self._executed_commands: list[dict] = []
+        self._interrupted = False
+        self._interrupted_command: str | None = None  # Track which command was interrupted for retry
+        self._remaining_commands: list[tuple[str, str, list[str]]] = []  # Commands that weren't executed
+        self._original_sigtstp = None
+        self._original_sigint = None
+    
+    def cleanup(self) -> None:
+        """Clean up any running threads or resources."""
+        if self._terminal_monitor:
+            self._terminal_monitor.stop()
+            self._terminal_monitor = None
+    
+    def _is_json_like(self, text: str) -> bool:
+        """Check if text looks like raw JSON that shouldn't be displayed."""
+        if not text:
+            return False
+        text = text.strip()
+        # Check for obvious JSON patterns
+        json_indicators = [
+            text.startswith(('{', '[', ']', '}')),
+            '"response_type"' in text,
+            '"do_commands"' in text,
+            '"command":' in text,
+            '"requires_sudo"' in text,
+            '{"' in text and '":' in text,
+            text.count('"') > 6 and ':' in text,  # Multiple quoted keys
+        ]
+        return any(json_indicators)
+    
+    def _setup_signal_handlers(self):
+        """Set up signal handlers for Ctrl+Z and Ctrl+C."""
+        self._original_sigtstp = signal.signal(signal.SIGTSTP, self._handle_interrupt)
+        self._original_sigint = signal.signal(signal.SIGINT, self._handle_interrupt)
+    
+    def _restore_signal_handlers(self):
+        """Restore original signal handlers."""
+        if self._original_sigtstp is not None:
+            signal.signal(signal.SIGTSTP, self._original_sigtstp)
+        if self._original_sigint is not None:
+            signal.signal(signal.SIGINT, self._original_sigint)
+    
+    def _handle_interrupt(self, signum, frame):
+        """Handle Ctrl+Z (SIGTSTP) or Ctrl+C (SIGINT) to stop current command only.
+        
+        This does NOT exit the session - it only stops the currently executing command.
+        The session continues so the user can decide what to do next.
+        """
+        self._interrupted = True
+        # Store the interrupted command for potential retry
+        self._interrupted_command = self._current_command
+        signal_name = "Ctrl+Z" if signum == signal.SIGTSTP else "Ctrl+C"
+        
+        console.print()
+        console.print(f"[yellow]⚠ {signal_name} detected - Stopping current command...[/yellow]")
+        
+        # Kill current subprocess if running
+        if self._current_process and self._current_process.poll() is None:
+            try:
+                self._current_process.terminate()
+                # Give it a moment to terminate gracefully
+                try:
+                    self._current_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._current_process.kill()
+                console.print(f"[yellow]   Stopped: {self._current_command}[/yellow]")
+            except Exception as e:
+                console.print(f"[dim]   Error stopping process: {e}[/dim]")
+        
+        # Note: We do NOT raise KeyboardInterrupt here
+        # The session continues - only the current command is stopped
+    
+    def _track_command_start(self, command: str, process: subprocess.Popen | None = None):
+        """Track when a command starts executing."""
+        self._current_command = command
+        self._current_process = process
+    
+    def _track_command_complete(self, command: str, success: bool, output: str = "", error: str = ""):
+        """Track when a command completes."""
+        self._executed_commands.append({
+            "command": command,
+            "success": success,
+            "output": output[:500] if output else "",
+            "error": error[:200] if error else "",
+            "timestamp": datetime.datetime.now().isoformat(),
+        })
+        self._current_command = None
+        self._current_process = None
+    
+    def _reset_execution_state(self):
+        """Reset execution tracking state for a new run."""
+        self._current_process = None
+        self._current_command = None
+        self._executed_commands = []
+        self._interrupted = False
+        self._interrupted_command = None
+        self._remaining_commands = []
+    
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.cleanup()
+    
+    def _show_expandable_output(self, output: str, command: str) -> None:
+        """Show output with expand/collapse capability."""
+        from rich.panel import Panel
+        from rich.text import Text
+        from rich.prompt import Prompt
+        
+        lines = output.split('\n')
+        total_lines = len(lines)
+        
+        # Always show first 3 lines as preview
+        preview_count = 3
+        
+        if total_lines <= preview_count + 2:
+            # Small output - just show it all
+            console.print(Panel(
+                output,
+                title=f"[dim]Output[/dim]",
+                title_align="left",
+                border_style="dim",
+                padding=(0, 1),
+            ))
+            return
+        
+        # Show collapsed preview
+        preview = '\n'.join(lines[:preview_count])
+        remaining = total_lines - preview_count
+        
+        content = Text()
+        content.append(preview)
+        content.append(f"\n\n[dim]─── {remaining} more lines hidden ───[/dim]", style="dim")
+        
+        console.print(Panel(
+            content,
+            title=f"[dim]Output ({total_lines} lines)[/dim]",
+            subtitle="[dim italic]Press Enter to continue, 'e' to expand[/dim italic]",
+            subtitle_align="right",
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        ))
+        
+        # Quick check if user wants to expand
+        try:
+            response = input().strip().lower()
+            if response == 'e':
+                # Show full output
+                console.print(Panel(
+                    output,
+                    title=f"[dim]Full Output ({total_lines} lines)[/dim]",
+                    title_align="left",
+                    border_style="green",
+                    padding=(0, 1),
+                ))
+        except (EOFError, KeyboardInterrupt):
+            pass
         
         # Initialize notification manager
         try:
@@ -110,37 +278,70 @@ class DoHandler:
         self,
         commands: list[tuple[str, str, list[str]]],
     ) -> bool:
-        """Show commands to user and request confirmation."""
-        console.print()
-        console.print(Panel(
-            "[bold yellow]⚠️  Cortex wants to execute the following commands[/bold yellow]",
-            expand=False,
-        ))
+        """Show commands to user and request confirmation with improved visual UI."""
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from rich.columns import Columns
+        from rich import box
+        
         console.print()
         
-        table = Table(show_header=True, header_style="bold cyan")
-        table.add_column("#", style="dim", width=3)
-        table.add_column("Command", style="green")
-        table.add_column("Purpose", style="white")
-        table.add_column("Protected Paths", style="yellow")
-        
-        for i, (cmd, purpose, protected) in enumerate(commands, 1):
-            protected_str = ", ".join(protected) if protected else "-"
-            table.add_row(str(i), cmd, purpose, protected_str)
-        
-        console.print(table)
-        console.print()
+        # Create a table for commands
+        cmd_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.ROUNDED,
+            border_style="blue",
+            expand=True,
+            padding=(0, 1),
+        )
+        cmd_table.add_column("#", style="bold cyan", width=3, justify="right")
+        cmd_table.add_column("Command", style="bold white")
+        cmd_table.add_column("Purpose", style="dim italic")
         
         all_protected = []
-        for _, _, protected in commands:
-            all_protected.extend(protected)
+        for i, (cmd, purpose, protected) in enumerate(commands, 1):
+            # Truncate long commands for display
+            cmd_display = cmd if len(cmd) <= 60 else cmd[:57] + "..."
+            purpose_display = purpose if len(purpose) <= 50 else purpose[:47] + "..."
+            
+            # Add protected path indicator
+            if protected:
+                cmd_display = f"{cmd_display} [yellow]⚠[/yellow]"
+                all_protected.extend(protected)
+            
+            cmd_table.add_row(str(i), cmd_display, purpose_display)
         
+        # Create header
+        header_text = Text()
+        header_text.append("🔐 ", style="bold")
+        header_text.append("Permission Required", style="bold white")
+        header_text.append(f"  ({len(commands)} command{'s' if len(commands) > 1 else ''})", style="dim")
+        
+        console.print(Panel(
+            cmd_table,
+            title=header_text,
+            title_align="left",
+            border_style="blue",
+            padding=(1, 1),
+        ))
+        
+        # Show protected paths if any
         if all_protected:
-            console.print("[bold red]⚠️  These commands will access protected system paths![/bold red]")
-            console.print(f"[dim]Protected paths: {', '.join(set(all_protected))}[/dim]")
-            console.print()
+            protected_set = set(all_protected)
+            protected_text = Text()
+            protected_text.append("⚠ Protected paths: ", style="bold yellow")
+            protected_text.append(", ".join(protected_set), style="dim yellow")
+            console.print(Panel(
+                protected_text,
+                border_style="yellow",
+                padding=(0, 1),
+                expand=False,
+            ))
         
-        return Confirm.ask("[bold]Do you want to proceed?[/bold]", default=False)
+        console.print()
+        return Confirm.ask("[bold]Proceed?[/bold]", default=False)
     
     def _needs_sudo(self, cmd: str, protected_paths: list[str]) -> bool:
         """Determine if a command needs sudo to execute."""
@@ -373,7 +574,7 @@ class DoHandler:
         needs_sudo: bool,
         timeout: int = 120
     ) -> tuple[bool, str, str]:
-        """Execute a single command with proper privilege handling."""
+        """Execute a single command with proper privilege handling and interruption support."""
         # Check for interactive commands that need a TTY
         if self._is_interactive_command(cmd):
             return self._handle_interactive_command(cmd, needs_sudo)
@@ -382,30 +583,62 @@ class DoHandler:
         if self._should_stream_output(cmd):
             return self._execute_with_streaming(cmd, needs_sudo, timeout=300)
         
+        # Track command start
+        self._track_command_start(cmd)
+        
         try:
+            # Flush output before sudo to handle password prompts cleanly
             if needs_sudo:
-                result = subprocess.run(
+                sys.stdout.flush()
+                sys.stderr.flush()
+            
+            # Use Popen for interruptibility
+            if needs_sudo:
+                process = subprocess.Popen(
                     ["sudo", "bash", "-c", cmd],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=timeout,
                 )
             else:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     cmd,
                     shell=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=timeout,
                 )
-            return (
-                result.returncode == 0,
-                result.stdout.strip(),
-                result.stderr.strip(),
-            )
-        except subprocess.TimeoutExpired:
-            return False, "", f"Command timed out after {timeout} seconds"
+            
+            # Store process for interruption handling
+            self._current_process = process
+            
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                
+                # Check if interrupted during execution
+                if self._interrupted:
+                    self._track_command_complete(cmd, False, stdout or "", "Command interrupted by user")
+                    return False, stdout.strip() if stdout else "", "Command interrupted by user"
+                
+                success = process.returncode == 0
+                
+                # Track completion
+                self._track_command_complete(cmd, success, stdout, stderr)
+                
+                # After sudo, reset console state
+                if needs_sudo:
+                    sys.stdout.write('')  # Force flush
+                    sys.stdout.flush()
+                
+                return (success, stdout.strip(), stderr.strip())
+                
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                self._track_command_complete(cmd, False, stdout, f"Command timed out after {timeout} seconds")
+                return False, stdout.strip() if stdout else "", f"Command timed out after {timeout} seconds"
         except Exception as e:
+            self._track_command_complete(cmd, False, "", str(e))
             return False, "", str(e)
     
     def _handle_interactive_command(
@@ -514,9 +747,23 @@ class DoHandler:
             console.print()
         
         # Phase 2: Execute Commands
+        from rich.panel import Panel
+        from rich.text import Text
+        
         for i, (cmd, purpose, protected) in enumerate(commands, 1):
-            console.print(f"[bold][{i}/{len(commands)}][/bold] {cmd}")
-            console.print(f"[dim]   └─ {purpose}[/dim]")
+            # Create a visually distinct panel for each command
+            cmd_header = Text()
+            cmd_header.append(f"[{i}/{len(commands)}] ", style="bold white on blue")
+            cmd_header.append(f" {cmd}", style="bold cyan")
+            
+            console.print()
+            console.print(Panel(
+                f"[bold cyan]{cmd}[/bold cyan]\n[dim]└─ {purpose}[/dim]",
+                title=f"[bold white] Command {i}/{len(commands)} [/bold white]",
+                title_align="left",
+                border_style="blue",
+                padding=(0, 1),
+            ))
             
             file_check = self._file_analyzer.check_file_exists_and_usefulness(cmd, purpose, user_query)
             
@@ -538,36 +785,75 @@ class DoHandler:
             if not success:
                 diagnosis = self._diagnoser.diagnose_error(cmd, stderr)
                 
-                console.print(f"[yellow]   ⚠ Error: {diagnosis['description']}[/yellow]")
-                console.print(f"[dim]   Error type: {diagnosis['error_type']} | Category: {diagnosis.get('category', 'unknown')}[/dim]")
+                # Create error panel for visual grouping
+                error_info = (
+                    f"[bold red]⚠ {diagnosis['description']}[/bold red]\n"
+                    f"[dim]Type: {diagnosis['error_type']} | Category: {diagnosis.get('category', 'unknown')}[/dim]"
+                )
+                console.print(Panel(
+                    error_info,
+                    title="[bold red] ❌ Error Detected [/bold red]",
+                    title_align="left",
+                    border_style="red",
+                    padding=(0, 1),
+                ))
                 
                 # Check if this is a login/credential required error
                 if diagnosis.get("category") == "login_required":
-                    console.print(f"[cyan]   🔐 Authentication required for this command[/cyan]")
+                    console.print(Panel(
+                        "[bold cyan]🔐 Authentication required for this command[/bold cyan]",
+                        border_style="cyan",
+                        padding=(0, 1),
+                        expand=False,
+                    ))
                     
                     login_success, login_msg = self._login_handler.handle_login(cmd, stderr)
                     
                     if login_success:
-                        console.print(f"[green]   ✓ {login_msg}[/green]")
-                        console.print(f"[cyan]   Retrying command...[/cyan]")
+                        console.print(Panel(
+                            f"[bold green]✓ {login_msg}[/bold green]\n[dim]Retrying command...[/dim]",
+                            border_style="green",
+                            padding=(0, 1),
+                            expand=False,
+                        ))
                         
                         # Retry the command after successful login
                         success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
                         
                         if success:
-                            console.print(f"[green]   ✓ Command succeeded after authentication![/green]")
+                            console.print(Panel(
+                                "[bold green]✓ Command succeeded after authentication![/bold green]",
+                                border_style="green",
+                                padding=(0, 1),
+                                expand=False,
+                            ))
                         else:
-                            console.print(f"[yellow]   Command still failed after login: {stderr[:100]}[/yellow]")
+                            console.print(Panel(
+                                f"[bold yellow]Command still failed after login[/bold yellow]\n[dim]{stderr[:100]}[/dim]",
+                                border_style="yellow",
+                                padding=(0, 1),
+                            ))
                     else:
-                        console.print(f"[yellow]   {login_msg}[/yellow]")
+                        console.print(f"[yellow]{login_msg}[/yellow]")
                 else:
                     # Not a login error, proceed with regular error handling
+                    extra_info = []
                     if diagnosis.get("extracted_path"):
-                        console.print(f"[dim]   Problematic path: {diagnosis['extracted_path']}[/dim]")
+                        extra_info.append(f"[dim]Path:[/dim] {diagnosis['extracted_path']}")
                     if diagnosis.get("extracted_info"):
                         for key, value in diagnosis["extracted_info"].items():
                             if value:
-                                console.print(f"[dim]   {key}: {value}[/dim]")
+                                extra_info.append(f"[dim]{key}:[/dim] {value}")
+                    
+                    if extra_info:
+                        console.print(Panel(
+                            "\n".join(extra_info),
+                            title="[dim] Error Details [/dim]",
+                            title_align="left",
+                            border_style="dim",
+                            padding=(0, 1),
+                            expand=False,
+                        ))
                     
                     fixed, fix_message, fix_commands = self._auto_fixer.auto_fix_error(
                         cmd, stderr, diagnosis, max_attempts=3
@@ -575,12 +861,27 @@ class DoHandler:
                     
                     if fixed:
                         success = True
-                        console.print(f"[green]   ✓ Auto-fixed: {fix_message}[/green]")
+                        console.print(Panel(
+                            f"[bold green]✓ Auto-fixed:[/bold green] {fix_message}",
+                            title="[bold green] Fix Successful [/bold green]",
+                            title_align="left",
+                            border_style="green",
+                            padding=(0, 1),
+                            expand=False,
+                        ))
                         _, stdout, stderr = self._execute_single_command(cmd, needs_sudo=True)
                     else:
+                        fix_info = []
                         if fix_commands:
-                            console.print(f"[yellow]   Attempted fixes: {len(fix_commands)} command(s)[/yellow]")
-                        console.print(f"[yellow]   Result: {fix_message}[/yellow]")
+                            fix_info.append(f"[dim]Attempted:[/dim] {len(fix_commands)} fix command(s)")
+                        fix_info.append(f"[bold yellow]Result:[/bold yellow] {fix_message}")
+                        console.print(Panel(
+                            "\n".join(fix_info),
+                            title="[bold yellow] Fix Incomplete [/bold yellow]",
+                            title_align="left",
+                            border_style="yellow",
+                            padding=(0, 1),
+                        ))
             
             cmd_log.duration_seconds = time.time() - start_time
             cmd_log.output = stdout
@@ -591,41 +892,67 @@ class DoHandler:
             run.files_accessed.extend(protected)
             
             if success:
-                console.print(f"[green]   ✓ Success ({cmd_log.duration_seconds:.2f}s)[/green]")
+                console.print(Panel(
+                    f"[bold green]✓ Success[/bold green]  [dim]({cmd_log.duration_seconds:.2f}s)[/dim]",
+                    border_style="green",
+                    padding=(0, 1),
+                    expand=False,
+                ))
                 if stdout:
-                    output_lines = stdout.split('\n')
-                    if len(output_lines) > 3:
-                        display_output = '\n'.join(output_lines[:3]) + f"\n   ... ({len(output_lines) - 3} more lines)"
-                    else:
-                        display_output = stdout[:200] + ('...' if len(stdout) > 200 else '')
-                    console.print(f"[dim]   {display_output}[/dim]")
+                    self._show_expandable_output(stdout, cmd)
             else:
-                console.print(f"[red]   ✗ Failed: {stderr[:200]}[/red]")
+                console.print(Panel(
+                    f"[bold red]✗ Failed[/bold red]\n[dim]{stderr[:200]}[/dim]",
+                    border_style="red",
+                    padding=(0, 1),
+                ))
                 
                 final_diagnosis = self._diagnoser.diagnose_error(cmd, stderr)
                 if final_diagnosis["fix_commands"] and not final_diagnosis["can_auto_fix"]:
-                    console.print(f"[yellow]   💡 Manual intervention required:[/yellow]")
-                    console.print(f"[yellow]      Issue: {final_diagnosis['description']}[/yellow]")
-                    
-                    console.print(f"[yellow]   Suggested commands to try:[/yellow]")
+                    # Create a manual intervention panel
+                    manual_content = [f"[bold yellow]Issue:[/bold yellow] {final_diagnosis['description']}", ""]
+                    manual_content.append("[bold]Suggested commands:[/bold]")
                     for fix_cmd in final_diagnosis["fix_commands"]:
                         if not fix_cmd.startswith("#"):
-                            console.print(f"[cyan]      $ {fix_cmd}[/cyan]")
+                            manual_content.append(f"  [cyan]$ {fix_cmd}[/cyan]")
                         else:
-                            console.print(f"[dim]      {fix_cmd}[/dim]")
+                            manual_content.append(f"  [dim]{fix_cmd}[/dim]")
+                    
+                    console.print(Panel(
+                        "\n".join(manual_content),
+                        title="[bold yellow] 💡 Manual Intervention Required [/bold yellow]",
+                        title_align="left",
+                        border_style="yellow",
+                        padding=(0, 1),
+                    ))
             
             console.print()
         
         self._granted_privileges = []
         
         # Phase 3: Verification Tests
-        console.print("[bold]Running verification tests...[/bold]")
+        console.print()
+        console.print(Panel(
+            "[bold]Running verification tests...[/bold]",
+            title="[bold cyan] 🧪 Verification Phase [/bold cyan]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+            expand=False,
+        ))
         all_tests_passed, test_results = self._verification_runner.run_verification_tests(run.commands, user_query)
         
         # Phase 4: Auto-repair if tests failed
         if not all_tests_passed:
             console.print()
-            console.print("[bold yellow]🔧 Auto-repairing test failures...[/bold yellow]")
+            console.print(Panel(
+                "[bold yellow]Attempting to repair test failures...[/bold yellow]",
+                title="[bold yellow] 🔧 Auto-Repair Phase [/bold yellow]",
+                title_align="left",
+                border_style="yellow",
+                padding=(0, 1),
+                expand=False,
+            ))
             
             repair_success = self._handle_test_failures(test_results, run)
             
@@ -642,12 +969,14 @@ class DoHandler:
         
         self.db.save_run(run)
         
+        # Generate LLM summary/answer
+        llm_answer = self._generate_llm_answer(run, user_query)
+        
+        # Print condensed execution summary with answer
+        self._print_execution_summary(run, answer=llm_answer)
+        
         console.print()
-        if all_tests_passed:
-            console.print(f"[bold green]✓ Run completed successfully[/bold green] (ID: {run.run_id})")
-        else:
-            console.print(f"[bold yellow]⚠ Run completed with issues[/bold yellow] (ID: {run.run_id})")
-        console.print(f"[dim]Summary: {run.summary}[/dim]")
+        console.print(f"[dim]Run ID: {run.run_id}[/dim]")
         
         return run
     
@@ -699,21 +1028,36 @@ class DoHandler:
         }
         icon = icons.get(resource_type, "📌")
         
-        # Display the conflict
+        # Display the conflict with visual grouping
+        from rich.panel import Panel
+        
+        status_text = "[bold cyan]Active[/bold cyan]" if is_active else "[dim yellow]Inactive[/dim yellow]"
+        conflict_content = (
+            f"{icon} [bold]{resource_type.replace('_', ' ').title()}:[/bold] '{resource_name}'\n"
+            f"[dim]Status:[/dim] {status_text}\n"
+            f"[dim]{suggestion}[/dim]"
+        )
+        
         console.print()
-        if is_active:
-            console.print(f"[cyan]   {icon} {resource_type.replace('_', ' ').title()} '{resource_name}' already exists![/cyan]")
-        else:
-            console.print(f"[yellow]   {icon} {resource_type.replace('_', ' ').title()} '{resource_name}' exists (inactive)[/yellow]")
-        console.print(f"[dim]   {suggestion}[/dim]")
+        console.print(Panel(
+            conflict_content,
+            title="[bold yellow] ⚠️ Resource Conflict [/bold yellow]",
+            title_align="left",
+            border_style="yellow",
+            padding=(0, 1),
+        ))
         
         # If there are alternatives, show them
         if alternatives:
-            console.print()
-            console.print("   [bold]What would you like to do?[/bold]")
+            options_content = ["[bold]What would you like to do?[/bold]", ""]
             for j, alt in enumerate(alternatives, 1):
-                console.print(f"   {j}. {alt['description']}")
-            console.print()
+                options_content.append(f"  {j}. {alt['description']}")
+            
+            console.print(Panel(
+                "\n".join(options_content),
+                border_style="dim",
+                padding=(0, 1),
+            ))
             
             from rich.prompt import Prompt
             choice = Prompt.ask(
@@ -890,6 +1234,9 @@ class DoHandler:
         user_query: str,
     ) -> DoRun:
         """Execute commands using the task tree system with advanced auto-repair."""
+        # Reset execution state for new run
+        self._reset_execution_state()
+        
         run = DoRun(
             run_id=self.db._generate_run_id(),
             summary="",
@@ -910,18 +1257,23 @@ class DoHandler:
         console.print(Panel(
             "[bold cyan]🌳 Task Tree Execution Mode[/bold cyan]\n"
             "[dim]Commands will be executed with auto-repair capabilities.[/dim]\n"
-            "[dim]Conflict detection and verification tests enabled.[/dim]",
+            "[dim]Conflict detection and verification tests enabled.[/dim]\n"
+            "[dim yellow]Press Ctrl+Z or Ctrl+C to stop execution at any time.[/dim yellow]",
             expand=False,
         ))
         console.print()
         
-        # Phase 1: Conflict Detection
-        console.print("[bold]📋 Phase 1: Checking for conflicts...[/bold]")
+        # Set up signal handlers for Ctrl+Z and Ctrl+C
+        self._setup_signal_handlers()
+        
+        # Phase 1: Conflict Detection - Claude-like header
+        console.print("[bold blue]━━━[/bold blue] [bold]Checking for Conflicts[/bold]")
         
         conflicts_found = []
         cleanup_commands = []
         commands_to_skip = set()  # Track commands that should be skipped (use existing)
         commands_to_replace = {}  # Track commands that should be replaced
+        resource_decisions = {}  # Track user decisions for each resource to avoid duplicate prompts
         
         for i, (cmd, purpose, protected) in enumerate(commands):
             conflict = self._conflict_detector.check_for_conflicts(cmd, purpose)
@@ -929,11 +1281,29 @@ class DoHandler:
                 conflicts_found.append((i, cmd, conflict))
         
         if conflicts_found:
-            console.print(f"[yellow]   Found {len(conflicts_found)} potential conflict(s)[/yellow]")
-            
+            # Deduplicate conflicts by resource name
+            unique_resources = {}
             for idx, cmd, conflict in conflicts_found:
-                # Handle any resource conflict with alternatives
-                handled = self._handle_resource_conflict(idx, cmd, conflict, commands_to_skip, cleanup_commands)
+                resource_name = conflict.get("resource_name", cmd)
+                if resource_name not in unique_resources:
+                    unique_resources[resource_name] = []
+                unique_resources[resource_name].append((idx, cmd, conflict))
+            
+            console.print(f"  [yellow]●[/yellow] Found [bold]{len(unique_resources)}[/bold] unique conflict(s)")
+            
+            for resource_name, resource_conflicts in unique_resources.items():
+                # Only ask once per unique resource
+                first_idx, first_cmd, first_conflict = resource_conflicts[0]
+                
+                # Handle the first conflict to get user's decision
+                decision = self._handle_resource_conflict(first_idx, first_cmd, first_conflict, commands_to_skip, cleanup_commands)
+                resource_decisions[resource_name] = decision
+                
+                # Apply the same decision to all other commands affecting this resource
+                if len(resource_conflicts) > 1:
+                    for idx, cmd, conflict in resource_conflicts[1:]:
+                        if first_idx in commands_to_skip:
+                            commands_to_skip.add(idx)
             
             # Run cleanup commands for non-Docker conflicts
             if cleanup_commands:
@@ -960,7 +1330,7 @@ class DoHandler:
                         task.output = "Using existing resource"
                 commands = filtered_commands
         else:
-            console.print("[green]   ✓ No conflicts detected[/green]")
+            console.print("  [green]●[/green] No conflicts detected")
         
         console.print()
         
@@ -972,96 +1342,165 @@ class DoHandler:
             console.print(f"[dim]📁 Protected paths: {', '.join(all_protected)}[/dim]")
             console.print()
         
-        # Phase 2: Execute Commands
-        console.print("[bold]🚀 Phase 2: Executing commands...[/bold]")
-        console.print()
-        
-        for root_task in self._task_tree.root_tasks:
-            self._execute_task_node(root_task, run, commands)
-        
-        # Phase 3: Verification Tests
-        console.print()
-        console.print("[bold]🧪 Phase 3: Running verification tests...[/bold]")
-        
-        all_tests_passed, test_results = self._verification_runner.run_verification_tests(run.commands, user_query)
-        
-        # Phase 4: Auto-repair if tests failed
-        if not all_tests_passed:
+        try:
+            # Phase 2: Execute Commands - Claude-like header
             console.print()
-            console.print("[bold]🔧 Phase 4: Auto-repairing test failures...[/bold]")
+            console.print("[bold blue]━━━[/bold blue] [bold]Executing Commands[/bold]")
+            console.print()
             
-            repair_success = self._handle_test_failures(test_results, run)
+            # Track remaining commands for resume functionality
+            executed_tasks = set()
+            for i, root_task in enumerate(self._task_tree.root_tasks):
+                if self._interrupted:
+                    # Store remaining tasks for potential continuation
+                    remaining_tasks = self._task_tree.root_tasks[i:]
+                    self._remaining_commands = [
+                        (t.command, t.purpose, [])
+                        for t in remaining_tasks
+                        if t.status not in (CommandStatus.SUCCESS, CommandStatus.SKIPPED)
+                    ]
+                    break
+                self._execute_task_node(root_task, run, commands)
+                executed_tasks.add(root_task.id)
             
-            if repair_success:
+            if not self._interrupted:
+                # Phase 3: Verification Tests - Claude-like header
                 console.print()
-                console.print("[dim]   Re-running verification tests...[/dim]")
+                console.print("[bold blue]━━━[/bold blue] [bold]Verification[/bold]")
+                
                 all_tests_passed, test_results = self._verification_runner.run_verification_tests(run.commands, user_query)
-        
-        run.completed_at = datetime.datetime.now().isoformat()
-        run.summary = self._generate_tree_summary(run)
-        
-        if test_results:
-            passed = sum(1 for t in test_results if t["passed"])
-            run.summary += f" | Tests: {passed}/{len(test_results)} passed"
-        
-        self.db.save_run(run)
-        
-        console.print()
-        console.print("[bold]Task Execution Tree:[/bold]")
-        self._task_tree.print_tree()
-        
-        console.print()
-        if all_tests_passed:
-            console.print(f"[bold green]✓ Run completed successfully[/bold green] (ID: {run.run_id})")
-        else:
-            console.print(f"[bold yellow]⚠ Run completed with issues[/bold yellow] (ID: {run.run_id})")
-        console.print(f"[dim]Summary: {run.summary}[/dim]")
-        
-        if self._permission_requests_count > 1:
-            console.print(f"[dim]Permission requests made: {self._permission_requests_count}[/dim]")
-        
-        # Interactive session - suggest next steps
-        self._interactive_session(run, commands, user_query)
-        
-        return run
+                
+                # Phase 4: Auto-repair if tests failed
+                if not all_tests_passed:
+                    console.print()
+                    console.print("[bold blue]━━━[/bold blue] [bold]Auto-Repair[/bold]")
+                    
+                    repair_success = self._handle_test_failures(test_results, run)
+                    
+                    if repair_success:
+                        console.print()
+                        console.print("[dim]   Re-running verification tests...[/dim]")
+                        all_tests_passed, test_results = self._verification_runner.run_verification_tests(run.commands, user_query)
+            else:
+                all_tests_passed = False
+                test_results = []
+            
+            run.completed_at = datetime.datetime.now().isoformat()
+            
+            if self._interrupted:
+                run.summary = f"INTERRUPTED after {len(self._executed_commands)} command(s)"
+            else:
+                run.summary = self._generate_tree_summary(run)
+                if test_results:
+                    passed = sum(1 for t in test_results if t["passed"])
+                    run.summary += f" | Tests: {passed}/{len(test_results)} passed"
+            
+            self.db.save_run(run)
+            
+            console.print()
+            console.print("[bold]Task Execution Tree:[/bold]")
+            self._task_tree.print_tree()
+            
+            # Generate LLM summary/answer if available
+            llm_answer = None
+            if not self._interrupted:
+                llm_answer = self._generate_llm_answer(run, user_query)
+            
+            # Print condensed execution summary with answer
+            self._print_execution_summary(run, answer=llm_answer)
+            
+            console.print()
+            if self._interrupted:
+                console.print(f"[dim]Run ID: {run.run_id} (interrupted)[/dim]")
+            elif all_tests_passed:
+                console.print(f"[dim]Run ID: {run.run_id}[/dim]")
+            
+            if self._permission_requests_count > 1:
+                console.print(f"[dim]Permission requests made: {self._permission_requests_count}[/dim]")
+            
+            # Reset interrupted flag before interactive session
+            # This allows the user to continue the session even after stopping a command
+            was_interrupted = self._interrupted
+            self._interrupted = False
+            
+            # Always go to interactive session - even after interruption
+            # User can decide what to do next (retry, skip, exit)
+            self._interactive_session(run, commands, user_query, was_interrupted=was_interrupted)
+            
+            return run
+            
+        finally:
+            # Always restore signal handlers
+            self._restore_signal_handlers()
     
     def _interactive_session(
         self,
         run: DoRun,
         commands: list[tuple[str, str, list[str]]],
         user_query: str,
+        was_interrupted: bool = False,
     ) -> None:
-        """Interactive session after task completion - suggest next steps."""
+        """Interactive session after task completion - suggest next steps.
+        
+        If was_interrupted is True, the previous command execution was stopped
+        by Ctrl+Z/Ctrl+C. We still continue the session so the user can decide
+        what to do next (retry, skip remaining, run different command, etc).
+        """
+        import sys
         from rich.prompt import Prompt
+        
+        # Flush any pending output to ensure clean display
+        sys.stdout.flush()
+        sys.stderr.flush()
         
         # Generate context-aware suggestions based on what was done
         suggestions = self._generate_suggestions(run, commands, user_query)
+        
+        # If interrupted, add special suggestions at the beginning
+        if was_interrupted:
+            interrupted_suggestions = [
+                {
+                    "label": "🔄 Retry interrupted command",
+                    "description": "Try running the interrupted command again",
+                    "type": "retry_interrupted",
+                },
+                {
+                    "label": "⏭️ Skip and continue",
+                    "description": "Skip the interrupted command and continue with remaining tasks",
+                    "type": "skip_and_continue",
+                },
+            ]
+            suggestions = interrupted_suggestions + suggestions
         
         # Track context for natural language processing
         context = {
             "original_query": user_query,
             "executed_commands": [cmd for cmd, _, _ in commands],
             "session_actions": [],
+            "was_interrupted": was_interrupted,
         }
         
         console.print()
-        console.print("[bold cyan]━━━ What would you like to do next? ━━━[/bold cyan]")
+        if was_interrupted:
+            console.print("[bold yellow]━━━[/bold yellow] [bold]Execution Interrupted - What would you like to do?[/bold]")
+        else:
+            console.print("[bold blue]━━━[/bold blue] [bold]Next Steps[/bold]")
         console.print()
         
         # Display suggestions
         self._display_suggestions(suggestions)
         
         console.print()
-        console.print("[dim]💡 Tip: You can type any request in natural language, like:[/dim]")
-        console.print("[dim]   • 'run the container on port 3000'[/dim]")
-        console.print("[dim]   • 'show me how to connect to it'[/dim]")
-        console.print("[dim]   • 'install another package called redis'[/dim]")
+        console.print("[dim]You can type any request in natural language[/dim]")
         console.print()
+        
+        # Ensure prompt is visible
+        sys.stdout.flush()
         
         while True:
             try:
                 response = Prompt.ask(
-                    "[bold]What would you like to do?[/bold]",
+                    "[bold cyan]>[/bold cyan]",
                     default="exit"
                 )
                 
@@ -1081,9 +1520,13 @@ class DoHandler:
                         self._execute_suggestion(suggestion, run, user_query)
                         context["session_actions"].append(suggestion.get("label", ""))
                         
-                        # Continue the session
+                        # Update last query to the suggestion for context-aware follow-ups
+                        suggestion_label = suggestion.get("label", "")
+                        context["last_query"] = suggestion_label
+                        
+                        # Continue the session with suggestions based on what was just done
                         console.print()
-                        suggestions = self._generate_suggestions(run, commands, user_query)
+                        suggestions = self._generate_suggestions_for_query(suggestion_label, context)
                         self._display_suggestions(suggestions)
                         console.print()
                         continue
@@ -1107,17 +1550,172 @@ class DoHandler:
                     # Update context with the new query for better suggestions
                     context["last_query"] = response_stripped
                     
-                    # Refresh suggestions based on new context
+                    # Refresh suggestions based on NEW query (not combined)
+                    # This ensures suggestions are relevant to what user just asked
                     console.print()
-                    # Use the new query for generating suggestions
-                    combined_query = f"{user_query}. Then: {response_stripped}"
-                    suggestions = self._generate_suggestions(run, commands, combined_query)
+                    suggestions = self._generate_suggestions_for_query(response_stripped, context)
                     self._display_suggestions(suggestions)
                     console.print()
                 
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]👋 Session ended.[/dim]")
                 break
+        
+        # Cleanup: ensure any terminal monitors are stopped
+        if self._terminal_monitor:
+            self._terminal_monitor.stop()
+            self._terminal_monitor = None
+    
+    def _generate_suggestions_for_query(self, query: str, context: dict) -> list[dict]:
+        """Generate suggestions based on the current query and context.
+        
+        This generates follow-up suggestions relevant to what the user just asked/did,
+        not tied to the original task.
+        """
+        suggestions = []
+        query_lower = query.lower()
+        
+        # User management related queries
+        if any(w in query_lower for w in ["user", "locked", "password", "account", "login"]):
+            suggestions.append({
+                "type": "info",
+                "icon": "👥",
+                "label": "List all users",
+                "description": "Show all system users",
+                "command": "cat /etc/passwd | cut -d: -f1",
+                "purpose": "List all users",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "🔐",
+                "label": "Check sudo users",
+                "description": "Show users with sudo access",
+                "command": "getent group sudo",
+                "purpose": "List sudo group members",
+            })
+            suggestions.append({
+                "type": "action",
+                "icon": "🔓",
+                "label": "Unlock a user",
+                "description": "Unlock a locked user account",
+                "demo_type": "unlock_user",
+            })
+        
+        # Service/process related queries
+        elif any(w in query_lower for w in ["service", "systemctl", "running", "process", "status"]):
+            suggestions.append({
+                "type": "info",
+                "icon": "📊",
+                "label": "List running services",
+                "description": "Show all active services",
+                "command": "systemctl list-units --type=service --state=running",
+                "purpose": "List running services",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "🔍",
+                "label": "Check failed services",
+                "description": "Show services that failed to start",
+                "command": "systemctl list-units --type=service --state=failed",
+                "purpose": "List failed services",
+            })
+        
+        # Disk/storage related queries
+        elif any(w in query_lower for w in ["disk", "storage", "space", "mount", "partition"]):
+            suggestions.append({
+                "type": "info",
+                "icon": "💾",
+                "label": "Check disk usage",
+                "description": "Show disk space by partition",
+                "command": "df -h",
+                "purpose": "Check disk usage",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "📁",
+                "label": "Find large files",
+                "description": "Show largest files on disk",
+                "command": "sudo du -ah / 2>/dev/null | sort -rh | head -20",
+                "purpose": "Find large files",
+            })
+        
+        # Network related queries
+        elif any(w in query_lower for w in ["network", "ip", "port", "connection", "firewall"]):
+            suggestions.append({
+                "type": "info",
+                "icon": "🌐",
+                "label": "Show network interfaces",
+                "description": "Display IP addresses and interfaces",
+                "command": "ip addr show",
+                "purpose": "Show network interfaces",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "🔌",
+                "label": "List open ports",
+                "description": "Show listening ports",
+                "command": "sudo ss -tlnp",
+                "purpose": "List open ports",
+            })
+        
+        # Security related queries
+        elif any(w in query_lower for w in ["security", "audit", "log", "auth", "fail"]):
+            suggestions.append({
+                "type": "info",
+                "icon": "🔒",
+                "label": "Check auth logs",
+                "description": "Show recent authentication attempts",
+                "command": "sudo tail -50 /var/log/auth.log",
+                "purpose": "Check auth logs",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "⚠️",
+                "label": "Check failed logins",
+                "description": "Show failed login attempts",
+                "command": "sudo lastb | head -20",
+                "purpose": "Check failed logins",
+            })
+        
+        # Package/installation related queries
+        elif any(w in query_lower for w in ["install", "package", "apt", "update"]):
+            suggestions.append({
+                "type": "action",
+                "icon": "📦",
+                "label": "Update system",
+                "description": "Update package lists and upgrade",
+                "command": "sudo apt update && sudo apt upgrade -y",
+                "purpose": "Update system packages",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "📋",
+                "label": "List installed packages",
+                "description": "Show recently installed packages",
+                "command": "apt list --installed 2>/dev/null | tail -20",
+                "purpose": "List installed packages",
+            })
+        
+        # Default: generic helpful suggestions
+        if not suggestions:
+            suggestions.append({
+                "type": "info",
+                "icon": "📊",
+                "label": "System overview",
+                "description": "Show system info and resource usage",
+                "command": "uname -a && uptime && free -h",
+                "purpose": "System overview",
+            })
+            suggestions.append({
+                "type": "info",
+                "icon": "🔍",
+                "label": "Check system logs",
+                "description": "View recent system messages",
+                "command": "sudo journalctl -n 20 --no-pager",
+                "purpose": "Check system logs",
+            })
+        
+        return suggestions
     
     def _display_suggestions(self, suggestions: list[dict]) -> None:
         """Display numbered suggestions."""
@@ -1196,13 +1794,33 @@ class DoHandler:
             
             response_type = llm_response.get("response_type")
             
+            # HARD CHECK: Filter out any raw JSON from reasoning field
+            reasoning = llm_response.get("reasoning", "")
+            if reasoning:
+                # Remove any JSON-like content from reasoning
+                import re
+                # If reasoning looks like JSON or contains JSON patterns, clean it
+                if (reasoning.strip().startswith(('{', '[', ']', '"response_type"')) or
+                    re.search(r'"do_commands"\s*:', reasoning) or
+                    re.search(r'"command"\s*:', reasoning) or
+                    re.search(r'"requires_sudo"\s*:', reasoning)):
+                    # Extract just the text explanation if possible
+                    text_match = re.search(r'"reasoning"\s*:\s*"([^"]+)"', reasoning)
+                    if text_match:
+                        reasoning = text_match.group(1)
+                    else:
+                        reasoning = "Processing your request..."
+                llm_response["reasoning"] = reasoning
+            
             # Handle do_commands - execute with confirmation
             if response_type == "do_commands" and llm_response.get("do_commands"):
                 do_commands = llm_response["do_commands"]
                 reasoning = llm_response.get("reasoning", "")
                 
-                console.print()
-                console.print(f"[cyan]🤖 {reasoning}[/cyan]")
+                # Final safety check: don't print JSON-looking reasoning
+                if reasoning and not self._is_json_like(reasoning):
+                    console.print()
+                    console.print(f"[cyan]🤖 {reasoning}[/cyan]")
                 console.print()
                 
                 # Show commands and ask for confirmation
@@ -1222,32 +1840,55 @@ class DoHandler:
                 
                 # Execute the commands
                 console.print()
+                from rich.panel import Panel
+                
                 executed_in_session = []
-                for cmd_info in do_commands:
+                for idx, cmd_info in enumerate(do_commands, 1):
                     cmd = cmd_info.get("command", "")
                     purpose = cmd_info.get("purpose", "Execute command")
                     needs_sudo = cmd_info.get("requires_sudo", False) or self._needs_sudo(cmd, [])
                     
-                    console.print(f"[COMMAND] {cmd}")
-                    console.print(f"   └─ {purpose}")
+                    # Create visual grouping for each command
+                    console.print()
+                    console.print(Panel(
+                        f"[bold cyan]{cmd}[/bold cyan]\n[dim]└─ {purpose}[/dim]",
+                        title=f"[bold] Command {idx}/{len(do_commands)} [/bold]",
+                        title_align="left",
+                        border_style="blue",
+                        padding=(0, 1),
+                    ))
                     
                     success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
                     
                     if success:
-                        console.print(f"   [green]✓ Success[/green]")
+                        console.print(Panel(
+                            f"[bold green]✓ Success[/bold green]",
+                            border_style="green",
+                            padding=(0, 1),
+                            expand=False,
+                        ))
                         if stdout:
                             output_preview = stdout[:300] + ('...' if len(stdout) > 300 else '')
-                            console.print(f"   [dim]{output_preview}[/dim]")
+                            console.print(f"[dim]{output_preview}[/dim]")
                         executed_in_session.append(cmd)
                     else:
-                        console.print(f"   [red]✗ Failed: {stderr[:150]}[/red]")
+                        console.print(Panel(
+                            f"[bold red]✗ Failed[/bold red]\n[dim]{stderr[:150]}[/dim]",
+                            border_style="red",
+                            padding=(0, 1),
+                        ))
                         
                         # Offer to diagnose and fix
-                        if Confirm.ask("   Try to auto-fix?", default=True):
+                        if Confirm.ask("Try to auto-fix?", default=True):
                             diagnosis = self._diagnoser.diagnose_error(cmd, stderr)
                             fixed, msg, _ = self._auto_fixer.auto_fix_error(cmd, stderr, diagnosis)
                             if fixed:
-                                console.print(f"   [green]✓ Fixed: {msg}[/green]")
+                                console.print(Panel(
+                                    f"[bold green]✓ Fixed:[/bold green] {msg}",
+                                    border_style="green",
+                                    padding=(0, 1),
+                                    expand=False,
+                                ))
                                 executed_in_session.append(cmd)
                 
                 # Track executed commands in context for suggestion generation
@@ -1279,10 +1920,15 @@ class DoHandler:
                 
                 return True
             
-            # Handle answer - just display it
+            # Handle answer - just display it (filter raw JSON)
             elif response_type == "answer" and llm_response.get("answer"):
-                console.print()
-                console.print(llm_response["answer"])
+                answer = llm_response["answer"]
+                # Don't print raw JSON or internal processing messages
+                if not (self._is_json_like(answer) or 
+                        "I'm processing your request" in answer or
+                        "I have a plan to execute" in answer):
+                    console.print()
+                    console.print(answer)
                 return True
             
             else:
@@ -1783,8 +2429,47 @@ If you cannot generate a safe command, respond with: {{"error": "reason"}}"""
         """Execute a suggestion."""
         suggestion_type = suggestion.get("type")
         
-        if suggestion_type == "demo":
+        if suggestion_type == "retry_interrupted":
+            # Retry the command that was interrupted
+            if self._interrupted_command:
+                console.print()
+                console.print(f"[cyan]🔄 Retrying:[/cyan] {self._interrupted_command}")
+                console.print()
+                
+                needs_sudo = "sudo" in self._interrupted_command or self._needs_sudo(self._interrupted_command, [])
+                success, stdout, stderr = self._execute_single_command(
+                    self._interrupted_command, 
+                    needs_sudo=needs_sudo
+                )
+                
+                if success:
+                    console.print(f"[green]✓ Success[/green]")
+                    if stdout:
+                        console.print(f"[dim]{stdout[:500]}{'...' if len(stdout) > 500 else ''}[/dim]")
+                    self._interrupted_command = None  # Clear after successful retry
+                else:
+                    console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+            else:
+                console.print("[yellow]No interrupted command to retry.[/yellow]")
+        elif suggestion_type == "skip_and_continue":
+            # Skip the interrupted command and continue with remaining
+            console.print()
+            console.print("[cyan]⏭️ Skipping interrupted command and continuing...[/cyan]")
+            self._interrupted_command = None
+            
+            if self._remaining_commands:
+                console.print(f"[dim]Remaining commands: {len(self._remaining_commands)}[/dim]")
+                for cmd, purpose, protected in self._remaining_commands:
+                    console.print(f"[dim]  • {cmd[:60]}{'...' if len(cmd) > 60 else ''}[/dim]")
+                console.print()
+                console.print("[dim]Use 'continue all' to execute remaining commands, or type a new request.[/dim]")
+            else:
+                console.print("[dim]No remaining commands to execute.[/dim]")
+        elif suggestion_type == "demo":
             self._show_demo(suggestion.get("demo_type", "generic"), suggestion)
+        elif suggestion_type == "test":
+            # Show test commands based on what was installed
+            self._show_test_commands(run, user_query)
         elif "command" in suggestion:
             console.print()
             console.print(f"[cyan]Executing:[/cyan] {suggestion['command']}")
@@ -1802,8 +2487,135 @@ If you cannot generate a safe command, respond with: {{"error": "reason"}}"""
                     console.print(f"[dim]{stdout[:500]}{'...' if len(stdout) > 500 else ''}[/dim]")
             else:
                 console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+        elif "manual_commands" in suggestion:
+            # Show manual commands
+            console.print()
+            console.print("[bold cyan]📋 Manual Commands:[/bold cyan]")
+            for cmd in suggestion["manual_commands"]:
+                console.print(f"  [green]$ {cmd}[/green]")
+            console.print()
+            console.print("[dim]Copy and run these commands in your terminal.[/dim]")
         else:
-            console.print("[yellow]This suggestion requires manual action.[/yellow]")
+            console.print("[yellow]No specific action available for this suggestion.[/yellow]")
+    
+    def _show_test_commands(self, run: DoRun, user_query: str) -> None:
+        """Show test commands based on what was installed/configured."""
+        from rich.panel import Panel
+        
+        console.print()
+        console.print("[bold cyan]🧪 Quick Test Commands[/bold cyan]")
+        console.print()
+        
+        test_commands = []
+        query_lower = user_query.lower()
+        
+        # Detect what was installed and suggest appropriate tests
+        executed_cmds = [c.command.lower() for c in run.commands if c.status.value == "success"]
+        all_cmds_str = " ".join(executed_cmds)
+        
+        # Web server tests
+        if "apache" in all_cmds_str or "apache2" in query_lower:
+            test_commands.extend([
+                ("Check Apache status", "systemctl status apache2"),
+                ("Test Apache config", "sudo apache2ctl -t"),
+                ("View in browser", "curl -I http://localhost"),
+            ])
+        
+        if "nginx" in all_cmds_str or "nginx" in query_lower:
+            test_commands.extend([
+                ("Check Nginx status", "systemctl status nginx"),
+                ("Test Nginx config", "sudo nginx -t"),
+                ("View in browser", "curl -I http://localhost"),
+            ])
+        
+        # Database tests
+        if "mysql" in all_cmds_str or "mysql" in query_lower:
+            test_commands.extend([
+                ("Check MySQL status", "systemctl status mysql"),
+                ("Test MySQL connection", "sudo mysql -e 'SELECT VERSION();'"),
+            ])
+        
+        if "postgresql" in all_cmds_str or "postgres" in query_lower:
+            test_commands.extend([
+                ("Check PostgreSQL status", "systemctl status postgresql"),
+                ("Test PostgreSQL", "sudo -u postgres psql -c 'SELECT version();'"),
+            ])
+        
+        # Docker tests
+        if "docker" in all_cmds_str or "docker" in query_lower:
+            test_commands.extend([
+                ("Check Docker status", "systemctl status docker"),
+                ("List containers", "docker ps -a"),
+                ("Test Docker", "docker run hello-world"),
+            ])
+        
+        # PHP tests
+        if "php" in all_cmds_str or "php" in query_lower or "lamp" in query_lower:
+            test_commands.extend([
+                ("Check PHP version", "php -v"),
+                ("Test PHP info", "php -i | head -20"),
+            ])
+        
+        # Node.js tests
+        if "node" in all_cmds_str or "nodejs" in query_lower:
+            test_commands.extend([
+                ("Check Node version", "node -v"),
+                ("Check npm version", "npm -v"),
+            ])
+        
+        # Python tests
+        if "python" in all_cmds_str or "python" in query_lower:
+            test_commands.extend([
+                ("Check Python version", "python3 --version"),
+                ("Check pip version", "pip3 --version"),
+            ])
+        
+        # Generic service tests
+        if not test_commands:
+            # Try to extract service names from commands
+            for cmd_log in run.commands:
+                if "systemctl" in cmd_log.command and cmd_log.status.value == "success":
+                    import re
+                    match = re.search(r'systemctl\s+(?:start|enable|restart)\s+(\S+)', cmd_log.command)
+                    if match:
+                        service = match.group(1)
+                        test_commands.append((f"Check {service} status", f"systemctl status {service}"))
+        
+        if not test_commands:
+            test_commands = [
+                ("Check system status", "systemctl --failed"),
+                ("View recent logs", "journalctl -n 20 --no-pager"),
+            ]
+        
+        # Display test commands
+        for i, (desc, cmd) in enumerate(test_commands[:6], 1):  # Limit to 6
+            console.print(f"  [bold]{i}.[/bold] {desc}")
+            console.print(f"     [green]$ {cmd}[/green]")
+            console.print()
+        
+        console.print("[dim]Copy and run these commands to verify your installation.[/dim]")
+        console.print()
+        
+        # Offer to run the first test
+        try:
+            response = input("[dim]Run first test? [y/N]: [/dim]").strip().lower()
+            if response in ['y', 'yes']:
+                if test_commands:
+                    desc, cmd = test_commands[0]
+                    console.print()
+                    console.print(f"[cyan]Running:[/cyan] {cmd}")
+                    needs_sudo = cmd.strip().startswith("sudo")
+                    success, stdout, stderr = self._execute_single_command(cmd, needs_sudo=needs_sudo)
+                    if success:
+                        console.print(f"[green]✓ {desc} - Passed[/green]")
+                        if stdout:
+                            console.print(Panel(stdout[:500], title="[dim]Output[/dim]", border_style="dim"))
+                    else:
+                        console.print(f"[red]✗ {desc} - Failed[/red]")
+                        if stderr:
+                            console.print(f"[dim red]{stderr[:200]}[/dim red]")
+        except (EOFError, KeyboardInterrupt):
+            pass
     
     def _show_demo(self, demo_type: str, suggestion: dict) -> None:
         """Show demo code/commands for a specific type."""
@@ -1949,8 +2761,9 @@ if __name__ == '__main__':
         
         # Check if task was marked as skipped (e.g., using existing resource)
         if task.status == CommandStatus.SKIPPED:
-            console.print(f"{indent}[cyan][SKIPPED] {task.command[:60]}{'...' if len(task.command) > 60 else ''}[/cyan]")
-            console.print(f"{indent}[green]   └─ ✓ {task.output or 'Using existing resource'}[/green]")
+            # Claude-like skipped output
+            console.print(f"{indent}[dim]○[/dim] [cyan]{task.command[:65]}{'...' if len(task.command) > 65 else ''}[/cyan]")
+            console.print(f"{indent}  [dim italic]↳ Skipped: {task.output or 'Using existing resource'}[/dim italic]")
             
             # Log the skipped command
             cmd_log = CommandLog(
@@ -1963,8 +2776,9 @@ if __name__ == '__main__':
             run.commands.append(cmd_log)
             return
         
-        console.print(f"{indent}[bold]{task_num}[/bold] {task.command[:60]}{'...' if len(task.command) > 60 else ''}")
-        console.print(f"{indent}[dim]   └─ {task.purpose}[/dim]")
+        # Claude-like command output
+        console.print(f"{indent}[bold cyan]●[/bold cyan] [bold]{task.command[:65]}{'...' if len(task.command) > 65 else ''}[/bold]")
+        console.print(f"{indent}  [dim italic]↳ {task.purpose}[/dim italic]")
         
         protected_paths = []
         user_query = run.user_query if run else ""
@@ -1988,6 +2802,22 @@ if __name__ == '__main__':
         task.error = stderr
         task.duration_seconds = time.time() - start_time
         
+        # Check if command was interrupted by Ctrl+Z/Ctrl+C
+        if self._interrupted:
+            task.status = CommandStatus.INTERRUPTED
+            cmd_log = CommandLog(
+                command=task.command,
+                purpose=task.purpose,
+                timestamp=datetime.datetime.now().isoformat(),
+                status=CommandStatus.INTERRUPTED,
+                output=stdout,
+                error="Command interrupted by user (Ctrl+Z/Ctrl+C)",
+                duration_seconds=task.duration_seconds,
+            )
+            console.print(f"{indent}  [yellow]⚠[/yellow] [dim]Interrupted ({task.duration_seconds:.2f}s)[/dim]")
+            run.commands.append(cmd_log)
+            return
+        
         cmd_log = CommandLog(
             command=task.command,
             purpose=task.purpose,
@@ -2000,10 +2830,12 @@ if __name__ == '__main__':
         
         if success:
             task.status = CommandStatus.SUCCESS
-            console.print(f"{indent}[green]   ✓ Success ({task.duration_seconds:.2f}s)[/green]")
+            # Claude-like success output
+            console.print(f"{indent}  [green]✓[/green] [dim]Done ({task.duration_seconds:.2f}s)[/dim]")
             if stdout:
                 output_preview = stdout[:100] + ('...' if len(stdout) > 100 else '')
-                console.print(f"{indent}[dim]   {output_preview}[/dim]")
+                console.print(f"{indent}  [dim]{output_preview}[/dim]")
+            console.print()
             run.commands.append(cmd_log)
             return
         
@@ -2011,8 +2843,9 @@ if __name__ == '__main__':
         diagnosis = self._diagnoser.diagnose_error(task.command, stderr)
         task.failure_reason = diagnosis.get("description", "Unknown error")
         
-        console.print(f"{indent}[yellow]   ⚠ Error: {diagnosis['error_type']}[/yellow]")
-        console.print(f"{indent}[dim]   {diagnosis['description']}[/dim]")
+        # Claude-like error output
+        console.print(f"{indent}  [red]✗[/red] [bold red]{diagnosis['error_type']}[/bold red]")
+        console.print(f"{indent}  [dim]{diagnosis['description'][:80]}{'...' if len(diagnosis['description']) > 80 else ''}[/dim]")
         
         # Check if this is a login/credential required error
         if diagnosis.get("category") == "login_required":
@@ -2072,8 +2905,12 @@ if __name__ == '__main__':
             return
         
         if task.repair_attempts < task.max_repair_attempts:
+            import sys
             task.repair_attempts += 1
             console.print(f"{indent}[cyan]   🔧 Auto-fix attempt {task.repair_attempts}/{task.max_repair_attempts}[/cyan]")
+            
+            # Flush output before auto-fix to ensure clean display after sudo prompts
+            sys.stdout.flush()
             
             fixed, fix_message, fix_commands = self._auto_fixer.auto_fix_error(
                 task.command, stderr, diagnosis, max_attempts=3
@@ -2100,25 +2937,68 @@ if __name__ == '__main__':
         
         task.status = CommandStatus.FAILED
         task.reasoning = self._generate_task_failure_reasoning(task, diagnosis)
-        console.print(f"{indent}[red]   ✗ Failed: {diagnosis['description'][:100]}[/red]")
-        console.print(f"{indent}[dim]   Reasoning: {task.reasoning}[/dim]")
         
-        if diagnosis.get("fix_commands") or stderr:
-            console.print(f"\n{indent}[yellow]💡 Manual intervention available[/yellow]")
+        error_type = diagnosis.get("error_type", "unknown")
+        
+        # Check if this is a "soft failure" that shouldn't warrant manual intervention
+        # These are cases where a tool/command simply isn't available and that's OK
+        soft_failure_types = {
+            "command_not_found",  # Tool not installed
+            "not_found",  # File/command doesn't exist
+            "no_such_command",
+            "unable_to_locate_package",  # Package doesn't exist in repos
+        }
+        
+        # Also check for patterns in the error message that indicate optional tools
+        optional_tool_patterns = [
+            "sensors",  # lm-sensors - optional hardware monitoring
+            "snap",  # snapd - optional package manager
+            "flatpak",  # optional package manager
+            "docker",  # optional if not needed
+            "podman",  # optional container runtime
+            "nmap",  # optional network scanner
+            "htop",  # optional system monitor
+            "iotop",  # optional I/O monitor
+            "iftop",  # optional network monitor
+        ]
+        
+        cmd_base = task.command.split()[0] if task.command else ""
+        is_optional_tool = any(pattern in cmd_base.lower() for pattern in optional_tool_patterns)
+        is_soft_failure = error_type in soft_failure_types and is_optional_tool
+        
+        if is_soft_failure:
+            # Mark as skipped instead of failed - this is an optional tool that's not available
+            task.status = CommandStatus.SKIPPED
+            task.reasoning = f"Tool '{cmd_base}' not available (optional)"
+            console.print(f"{indent}[yellow]   ○ Skipped: {cmd_base} not available (optional tool)[/yellow]")
+            console.print(f"{indent}[dim]   This tool provides additional info but isn't required[/dim]")
+            cmd_log.status = CommandStatus.SKIPPED
+        else:
+            console.print(f"{indent}[red]   ✗ Failed: {diagnosis['description'][:100]}[/red]")
+            console.print(f"{indent}[dim]   Reasoning: {task.reasoning}[/dim]")
             
-            suggested_cmds = diagnosis.get("fix_commands", [f"sudo {task.command}"])
-            console.print(f"{indent}[dim]   Suggested commands:[/dim]")
-            for cmd in suggested_cmds[:3]:
-                console.print(f"{indent}[cyan]   $ {cmd}[/cyan]")
+            # Only offer manual intervention for errors that could actually be fixed manually
+            # Don't offer for missing commands/packages that auto-fix couldn't resolve
+            should_offer_manual = (
+                diagnosis.get("fix_commands") or stderr
+            ) and error_type not in {"command_not_found", "not_found", "unable_to_locate_package"}
             
-            if Confirm.ask(f"{indent}Run manually while Cortex monitors?", default=False):
-                manual_success = self._supervise_manual_intervention_for_task(
-                    task, suggested_cmds, run
-                )
-                if manual_success:
-                    task.status = CommandStatus.SUCCESS
-                    task.reasoning = "Completed via monitored manual intervention"
-                    cmd_log.status = CommandStatus.SUCCESS
+            if should_offer_manual:
+                console.print(f"\n{indent}[yellow]💡 Manual intervention available[/yellow]")
+                
+                suggested_cmds = diagnosis.get("fix_commands", [f"sudo {task.command}"])
+                console.print(f"{indent}[dim]   Suggested commands:[/dim]")
+                for cmd in suggested_cmds[:3]:
+                    console.print(f"{indent}[cyan]   $ {cmd}[/cyan]")
+                
+                if Confirm.ask(f"{indent}Run manually while Cortex monitors?", default=False):
+                    manual_success = self._supervise_manual_intervention_for_task(
+                        task, suggested_cmds, run
+                    )
+                    if manual_success:
+                        task.status = CommandStatus.SUCCESS
+                        task.reasoning = "Completed via monitored manual intervention"
+                        cmd_log.status = CommandStatus.SUCCESS
         
         cmd_log.status = task.status
         run.commands.append(cmd_log)
@@ -2130,72 +3010,277 @@ if __name__ == '__main__':
         run: DoRun,
     ) -> bool:
         """Supervise manual intervention for a specific task with terminal monitoring."""
-        console.print("\n[bold cyan]═══ Manual Intervention Mode ═══[/bold cyan]")
-        console.print("\n[yellow]Run these commands in another terminal:[/yellow]")
+        from rich.panel import Panel
+        from rich.prompt import Prompt
         
-        for i, cmd in enumerate(suggested_commands, 1):
-            console.print(f"[bold]{i}. {cmd}[/bold]")
+        # If no suggested commands provided, use the task command with sudo
+        if not suggested_commands:
+            if task and task.command:
+                # Add sudo if not already present
+                cmd = task.command
+                if not cmd.strip().startswith("sudo"):
+                    cmd = f"sudo {cmd}"
+                suggested_commands = [cmd]
         
+        # Claude-like manual intervention UI
+        console.print()
+        console.print("[bold blue]━━━[/bold blue] [bold]Manual Intervention[/bold]")
+        console.print()
+        
+        # Show the task context
+        if task and task.purpose:
+            console.print(f"[bold]Task:[/bold] {task.purpose}")
+            console.print()
+        
+        console.print("[dim]Run these commands in another terminal:[/dim]")
+        console.print()
+        
+        # Show commands in a clear box
+        if suggested_commands:
+            from rich.panel import Panel
+            cmd_text = "\n".join(f"  {i}. {cmd}" for i, cmd in enumerate(suggested_commands, 1))
+            console.print(Panel(
+                cmd_text,
+                title="[bold cyan]📋 Commands to Run[/bold cyan]",
+                border_style="cyan",
+                padding=(0, 1),
+            ))
+        else:
+            console.print("  [yellow]⚠ No specific commands - check the task above[/yellow]")
+        
+        console.print()
+        
+        # Track expected commands for matching
+        self._expected_manual_commands = suggested_commands.copy() if suggested_commands else []
+        self._completed_manual_commands: list[str] = []
+        
+        # Start terminal monitoring with detailed output
         self._terminal_monitor = TerminalMonitor(
             notification_callback=lambda title, msg: self._send_notification(title, msg)
         )
-        self._terminal_monitor.start()
+        self._terminal_monitor.start(expected_commands=suggested_commands)
         
-        console.print("\n[dim]🔍 Cortex is now monitoring your terminal for issues...[/dim]")
+        console.print()
+        console.print("[dim]Type 'done' when finished, 'help' for tips, or 'cancel' to abort[/dim]")
+        console.print()
         
         try:
             while True:
-                console.print()
-                action = Confirm.ask("Have you completed the manual step?", default=True)
+                try:
+                    user_input = Prompt.ask("[cyan]Status[/cyan]", default="done").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[yellow]Manual intervention cancelled[/yellow]")
+                    return False
                 
-                if action:
-                    success = Confirm.ask("Was it successful?", default=True)
+                # Handle natural language responses
+                if user_input in ["done", "finished", "complete", "completed", "success", "worked", "yes", "y"]:
+                    # Show observed commands and check for matches
+                    observed = self._terminal_monitor.get_observed_commands()
+                    matched_commands = []
+                    unmatched_commands = []
                     
-                    if success:
-                        console.print("[green]✓ Manual step completed successfully[/green]")
+                    if observed:
+                        console.print(f"\n[cyan]📊 Observed {len(observed)} command(s):[/cyan]")
+                        for obs in observed[-5:]:
+                            obs_cmd = obs['command']
+                            is_matched = False
+                            
+                            # Check if this matches any expected command
+                            for expected in self._expected_manual_commands:
+                                if self._commands_match(obs_cmd, expected):
+                                    matched_commands.append(obs_cmd)
+                                    self._completed_manual_commands.append(expected)
+                                    console.print(f"   • {obs_cmd[:60]}... [green]✓[/green]")
+                                    is_matched = True
+                                    break
+                            
+                            if not is_matched:
+                                unmatched_commands.append(obs_cmd)
+                                console.print(f"   • {obs_cmd[:60]}... [yellow]?[/yellow]")
+                    
+                    # Check if expected commands were actually run
+                    if self._expected_manual_commands and not matched_commands:
+                        console.print()
+                        console.print("[yellow]⚠ None of the expected commands were detected.[/yellow]")
+                        console.print("[dim]Expected:[/dim]")
+                        for cmd in self._expected_manual_commands[:3]:
+                            console.print(f"   [cyan]$ {cmd}[/cyan]")
+                        console.print()
                         
+                        # Send notification with correct commands
+                        self._send_notification(
+                            "⚠️ Cortex: Expected Commands",
+                            f"Run: {self._expected_manual_commands[0][:50]}..."
+                        )
+                        
+                        console.print("[dim]Type 'done' again to confirm, or run the expected commands first.[/dim]")
+                        continue  # Don't mark as success yet - let user try again
+                    
+                    # Check if any observed commands had errors (check last few)
+                    has_errors = False
+                    if observed:
+                        for obs in observed[-3:]:
+                            if obs.get('has_error') or obs.get('status') == 'failed':
+                                has_errors = True
+                                console.print("[yellow]⚠ Some commands may have failed. Please verify.[/yellow]")
+                                break
+                    
+                    if has_errors and not user_input in ["yes", "y", "worked", "success"]:
+                        console.print("[dim]Type 'success' to confirm it worked anyway.[/dim]")
+                        continue
+                    
+                    console.print("[green]✓ Manual step completed successfully[/green]")
+                    
+                    if self._task_tree:
                         verify_task = self._task_tree.add_verify_task(
                             parent=task,
                             command="# Manual verification",
                             purpose="User confirmed manual intervention success",
                         )
                         verify_task.status = CommandStatus.SUCCESS
-                        
-                        return True
+                    
+                    # Mark matched commands as completed so they're not re-executed
+                    if matched_commands:
+                        task.manual_commands_completed = matched_commands
+                    
+                    return True
+                
+                elif user_input in ["help", "?", "hint", "tips"]:
+                    console.print()
+                    console.print("[bold]💡 Manual Intervention Tips:[/bold]")
+                    console.print("   • Use [cyan]sudo[/cyan] if you see 'Permission denied'")
+                    console.print("   • Use [cyan]sudo su -[/cyan] to become root")
+                    console.print("   • Check paths with [cyan]ls -la <path>[/cyan]")
+                    console.print("   • Check services: [cyan]systemctl status <service>[/cyan]")
+                    console.print("   • View logs: [cyan]journalctl -u <service> -n 50[/cyan]")
+                    console.print()
+                
+                elif user_input in ["cancel", "abort", "quit", "exit", "no", "n"]:
+                    console.print("[yellow]Manual intervention cancelled[/yellow]")
+                    return False
+                
+                elif user_input in ["failed", "error", "problem", "issue"]:
+                    console.print()
+                    error_desc = Prompt.ask("[yellow]What error did you encounter?[/yellow]")
+                    error_lower = error_desc.lower()
+                    
+                    # Provide contextual help based on error description
+                    if "permission" in error_lower or "denied" in error_lower:
+                        console.print("\n[cyan]💡 Try running with sudo:[/cyan]")
+                        for cmd in suggested_commands[:2]:
+                            if not cmd.startswith("sudo"):
+                                console.print(f"   [green]sudo {cmd}[/green]")
+                    elif "not found" in error_lower or "no such" in error_lower:
+                        console.print("\n[cyan]💡 Check if path/command exists:[/cyan]")
+                        console.print("   [green]which <command>[/green]")
+                        console.print("   [green]ls -la <path>[/green]")
+                    elif "service" in error_lower or "systemctl" in error_lower:
+                        console.print("\n[cyan]💡 Service troubleshooting:[/cyan]")
+                        console.print("   [green]sudo systemctl status <service>[/green]")
+                        console.print("   [green]sudo journalctl -u <service> -n 50[/green]")
                     else:
-                        console.print("\n[yellow]What happened?[/yellow]")
-                        console.print("  1. Still permission denied")
-                        console.print("  2. File/path not found")
-                        console.print("  3. Service error")
-                        console.print("  4. Other error")
-                        
-                        try:
-                            choice = input("Enter choice (1-4): ").strip()
-                        except (EOFError, KeyboardInterrupt):
-                            return False
-                        
-                        if choice == "1":
-                            console.print("\n[cyan]Try: sudo su - then run the command[/cyan]")
-                        elif choice == "2":
-                            console.print("\n[cyan]Verify the path exists: ls -la <path>[/cyan]")
-                        elif choice == "3":
-                            console.print("\n[cyan]Check service status: systemctl status <service>[/cyan]")
-                        else:
-                            console.print("\n[cyan]Please describe the error and try again[/cyan]")
-                        
-                        retry = Confirm.ask("Continue trying?", default=True)
-                        if not retry:
-                            return False
+                        console.print("\n[cyan]💡 General debugging:[/cyan]")
+                        console.print("   • Check the error message carefully")
+                        console.print("   • Try running with sudo")
+                        console.print("   • Check if all required packages are installed")
+                    
+                    console.print()
+                    console.print("[dim]Type 'done' when fixed, or 'cancel' to abort[/dim]")
+                
                 else:
-                    console.print("[dim]Take your time. Cortex is still monitoring...[/dim]")
+                    # Any other input - show status
+                    observed = self._terminal_monitor.get_observed_commands()
+                    console.print(f"[dim]Still monitoring... ({len(observed)} commands observed)[/dim]")
+                    console.print("[dim]Type 'done' when finished, 'help' for tips[/dim]")
                     
         except KeyboardInterrupt:
             console.print("\n[yellow]Manual intervention cancelled[/yellow]")
             return False
         finally:
             if self._terminal_monitor:
-                self._terminal_monitor.stop()
+                observed = self._terminal_monitor.stop()
+                # Log observed commands to run
+                for obs in observed:
+                    run.commands.append(CommandLog(
+                        command=obs["command"],
+                        purpose=f"Manual execution ({obs['source']})",
+                        timestamp=obs["timestamp"],
+                        status=CommandStatus.SUCCESS,
+                    ))
                 self._terminal_monitor = None
+            
+            # Clear tracking
+            self._expected_manual_commands = []
+    
+    def _commands_match(self, observed: str, expected: str) -> bool:
+        """Check if an observed command matches an expected command.
+        
+        Handles variations like:
+        - With/without sudo
+        - Different whitespace
+        - Same command with different args still counts
+        """
+        # Normalize commands
+        obs_normalized = observed.strip().lower()
+        exp_normalized = expected.strip().lower()
+        
+        # Remove sudo prefix for comparison
+        if obs_normalized.startswith("sudo "):
+            obs_normalized = obs_normalized[5:].strip()
+        if exp_normalized.startswith("sudo "):
+            exp_normalized = exp_normalized[5:].strip()
+        
+        # Exact match
+        if obs_normalized == exp_normalized:
+            return True
+        
+        obs_parts = obs_normalized.split()
+        exp_parts = exp_normalized.split()
+        
+        # Check for service management commands first (need full match including service name)
+        service_commands = ["systemctl", "service"]
+        for svc_cmd in service_commands:
+            if svc_cmd in obs_normalized and svc_cmd in exp_normalized:
+                # Extract action and service name
+                obs_action = None
+                exp_action = None
+                obs_service = None
+                exp_service = None
+                
+                for i, part in enumerate(obs_parts):
+                    if part in ["restart", "start", "stop", "reload", "status", "enable", "disable"]:
+                        obs_action = part
+                        # Service name is usually the next word
+                        if i + 1 < len(obs_parts):
+                            obs_service = obs_parts[i + 1]
+                        break
+                
+                for i, part in enumerate(exp_parts):
+                    if part in ["restart", "start", "stop", "reload", "status", "enable", "disable"]:
+                        exp_action = part
+                        if i + 1 < len(exp_parts):
+                            exp_service = exp_parts[i + 1]
+                        break
+                
+                if obs_action and exp_action and obs_service and exp_service:
+                    if obs_action == exp_action and obs_service == exp_service:
+                        return True
+                    else:
+                        return False  # Different action or service
+        
+        # For non-service commands, check if first 2-3 words match
+        if len(obs_parts) >= 2 and len(exp_parts) >= 2:
+            # Skip if either is a service command (handled above)
+            if obs_parts[0] not in ["systemctl", "service"] and exp_parts[0] not in ["systemctl", "service"]:
+                # Compare first two words (command and subcommand)
+                if obs_parts[:2] == exp_parts[:2]:
+                    return True
+        
+        return False
+    
+    def get_completed_manual_commands(self) -> list[str]:
+        """Get list of commands completed during manual intervention."""
+        return getattr(self, '_completed_manual_commands', [])
     
     def _generate_task_failure_reasoning(
         self,
@@ -2322,16 +3407,7 @@ if __name__ == '__main__':
         
         observed = monitor.stop_monitoring()
         
-        console.print()
-        console.print("[bold]📊 Execution Summary:[/bold]")
-        
-        if observed:
-            console.print(f"[green]Observed {len(observed)} commands in terminal[/green]")
-            for obs in observed[-10:]:
-                console.print(f"[dim]  • {obs['command']}[/dim]")
-        else:
-            console.print("[yellow]No commands observed (this is normal if bash history sync is disabled)[/yellow]")
-        
+        # Add observed commands to the run
         for obs in observed:
             run.commands.append(CommandLog(
                 command=obs["command"],
@@ -2345,9 +3421,14 @@ if __name__ == '__main__':
         
         self.db.save_run(run)
         
+        # Generate LLM summary/answer
+        llm_answer = self._generate_llm_answer(run, user_query)
+        
+        # Print condensed execution summary with answer
+        self._print_execution_summary(run, answer=llm_answer)
+        
         console.print()
-        console.print(f"[bold green]✓ Session recorded[/bold green] (ID: {run.run_id})")
-        console.print(f"[dim]Summary: {run.summary}[/dim]")
+        console.print(f"[dim]Run ID: {run.run_id}[/dim]")
         
         return run
     
@@ -2362,6 +3443,196 @@ if __name__ == '__main__':
             return f"Successfully executed {successful} commands ({mode_str}) for: {run.user_query[:50]}"
         else:
             return f"Executed {successful} commands with {failed} failures ({mode_str}) for: {run.user_query[:50]}"
+    
+    def _generate_llm_answer(self, run: DoRun, user_query: str) -> str | None:
+        """Generate an LLM-based answer/summary after command execution."""
+        if not self.llm_callback:
+            return None
+        
+        # Collect command outputs
+        command_results = []
+        for cmd in run.commands:
+            status = "✓" if cmd.status == CommandStatus.SUCCESS else "✗" if cmd.status == CommandStatus.FAILED else "○"
+            result = {
+                "command": cmd.command,
+                "purpose": cmd.purpose,
+                "status": status,
+                "output": (cmd.output[:500] if cmd.output else "")[:500],  # Limit output size
+            }
+            if cmd.error:
+                result["error"] = cmd.error[:200]
+            command_results.append(result)
+        
+        # Build prompt for LLM
+        prompt = f"""The user asked: "{user_query}"
+
+The following commands were executed:
+"""
+        for i, result in enumerate(command_results, 1):
+            prompt += f"\n{i}. [{result['status']}] {result['command']}"
+            prompt += f"\n   Purpose: {result['purpose']}"
+            if result.get('output'):
+                # Only include meaningful output, not empty or whitespace-only
+                output_preview = result['output'].strip()[:200]
+                if output_preview:
+                    prompt += f"\n   Output: {output_preview}"
+            if result.get('error'):
+                prompt += f"\n   Error: {result['error']}"
+        
+        prompt += """
+
+Based on the above execution results, provide a helpful summary/answer for the user.
+Focus on:
+1. What was accomplished
+2. Any issues encountered and their impact
+3. Key findings or results from the commands
+4. Any recommendations for next steps
+
+Keep the response concise (2-4 paragraphs max). Do NOT include JSON in your response.
+Respond directly with the answer text only."""
+
+        try:
+            from rich.console import Console
+            from rich.status import Status
+            
+            console = Console()
+            with Status("[cyan]Generating summary...[/cyan]", spinner="dots"):
+                result = self.llm_callback(prompt)
+            
+            if result:
+                # Handle different response formats
+                if isinstance(result, dict):
+                    # Extract answer from various possible keys
+                    answer = result.get("answer") or result.get("response") or result.get("text") or ""
+                    if not answer and "reasoning" in result:
+                        answer = result.get("reasoning", "")
+                elif isinstance(result, str):
+                    answer = result
+                else:
+                    return None
+                
+                # Clean the answer
+                answer = answer.strip()
+                
+                # Filter out JSON-like responses
+                if answer.startswith('{') or answer.startswith('['):
+                    return None
+                
+                return answer if answer else None
+        except Exception as e:
+            # Silently fail - summary is optional
+            import logging
+            logging.debug(f"LLM summary generation failed: {e}")
+            return None
+        
+        return None
+    
+    def _print_execution_summary(self, run: DoRun, answer: str | None = None):
+        """Print a condensed execution summary with improved visual design."""
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from rich import box
+        
+        # Count statuses
+        successful = [c for c in run.commands if c.status == CommandStatus.SUCCESS]
+        failed = [c for c in run.commands if c.status == CommandStatus.FAILED]
+        skipped = [c for c in run.commands if c.status == CommandStatus.SKIPPED]
+        interrupted = [c for c in run.commands if c.status == CommandStatus.INTERRUPTED]
+        
+        total = len(run.commands)
+        
+        # Build status header
+        console.print()
+        
+        # Create a status bar
+        if total > 0:
+            status_text = Text()
+            status_text.append("  ")
+            if successful:
+                status_text.append(f"✓ {len(successful)} ", style="bold green")
+            if failed:
+                status_text.append(f"✗ {len(failed)} ", style="bold red")
+            if skipped:
+                status_text.append(f"○ {len(skipped)} ", style="bold yellow")
+            if interrupted:
+                status_text.append(f"⚠ {len(interrupted)} ", style="bold yellow")
+            
+            # Calculate success rate
+            success_rate = (len(successful) / total * 100) if total > 0 else 0
+            status_text.append(f"  ({success_rate:.0f}% success)", style="dim")
+            
+            console.print(Panel(
+                status_text,
+                title="[bold white on blue] 📊 Execution Status [/bold white on blue]",
+                title_align="left",
+                border_style="blue",
+                padding=(0, 1),
+                expand=False,
+            ))
+        
+        # Create a table for detailed results
+        if successful or failed or skipped:
+            result_table = Table(
+                show_header=True,
+                header_style="bold",
+                box=box.SIMPLE,
+                padding=(0, 1),
+                expand=True,
+            )
+            result_table.add_column("Status", width=8, justify="center")
+            result_table.add_column("Action", style="white")
+            
+            # Add successful commands
+            for cmd in successful[:4]:
+                purpose = cmd.purpose[:60] + "..." if len(cmd.purpose) > 60 else cmd.purpose
+                result_table.add_row("[green]✓ Done[/green]", purpose)
+            if len(successful) > 4:
+                result_table.add_row("[dim]...[/dim]", f"[dim]and {len(successful) - 4} more completed[/dim]")
+            
+            # Add failed commands
+            for cmd in failed[:2]:
+                error_short = (cmd.error[:40] + "...") if cmd.error and len(cmd.error) > 40 else (cmd.error or "Unknown")
+                result_table.add_row("[red]✗ Failed[/red]", f"{cmd.command[:30]}... - {error_short}")
+            
+            # Add skipped commands
+            for cmd in skipped[:2]:
+                purpose = cmd.purpose[:50] + "..." if len(cmd.purpose) > 50 else cmd.purpose
+                result_table.add_row("[yellow]○ Skip[/yellow]", purpose)
+            
+            console.print(Panel(
+                result_table,
+                title="[bold] 📋 Details [/bold]",
+                title_align="left",
+                border_style="dim",
+                padding=(0, 0),
+            ))
+        
+        # Answer section (for questions) - make it prominent
+        if answer:
+            # Clean the answer - remove any JSON-like content that might have leaked
+            clean_answer = answer
+            if clean_answer.startswith('{') or '{"' in clean_answer[:50]:
+                # Looks like JSON leaked through, try to extract readable parts
+                import re
+                # Try to extract just the answer field if present
+                answer_match = re.search(r'"answer"\s*:\s*"([^"]*)"', clean_answer)
+                if answer_match:
+                    clean_answer = answer_match.group(1)
+            
+            # Truncate very long answers
+            if len(clean_answer) > 500:
+                display_answer = clean_answer[:500] + "\n\n[dim]... (truncated)[/dim]"
+            else:
+                display_answer = clean_answer
+            
+            console.print(Panel(
+                display_answer,
+                title="[bold white on green] 💡 Answer [/bold white on green]",
+                title_align="left",
+                border_style="green",
+                padding=(1, 2),
+            ))
     
     def get_run_history(self, limit: int = 20) -> list[DoRun]:
         """Get recent do run history."""

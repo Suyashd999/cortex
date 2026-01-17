@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -545,7 +546,11 @@ class CortexCLI:
                 return 1
             
             answer = handler.ask(question)
-            console.print(answer)
+            # Don't print raw JSON or processing messages
+            if answer and not (answer.strip().startswith('{') or 
+                               "I'm processing your request" in answer or
+                               "I have a plan to execute" in answer):
+                console.print(answer)
             return 0
         except ImportError as e:
             # Provide a helpful message if provider SDK is missing
@@ -563,6 +568,7 @@ class CortexCLI:
     
     def _run_interactive_do_session(self, handler: AskHandler) -> int:
         """Run an interactive --do session where user can type queries."""
+        import signal
         from rich.panel import Panel
         from rich.prompt import Prompt
         
@@ -575,123 +581,267 @@ class CortexCLI:
         if handler._do_handler:
             handler._do_handler.current_session_id = session_id
         
-        console.print()
-        console.print(Panel(
-            "[bold cyan]🚀 Cortex Interactive Session[/bold cyan]\n\n"
-            f"[dim]Session ID: {session_id[:30]}...[/dim]\n\n"
-            "Type what you want to do and Cortex will help you.\n"
-            "Commands will be shown for approval before execution.\n\n"
-            "[dim]Examples:[/dim]\n"
-            "  • install docker and run nginx\n"
-            "  • setup a postgresql database\n"
-            "  • configure nginx to proxy port 3000\n"
-            "  • check system resources\n\n"
-            "[dim]Type 'exit' or 'quit' to end the session.[/dim]",
-            title="[bold green]Welcome[/bold green]",
-            border_style="cyan",
-        ))
-        console.print()
+        # Track if we're currently processing a request
+        processing_request = False
+        request_interrupted = False
         
-        session_history = []  # Track what was done in this session
-        run_count = 0
+        class SessionInterrupt(Exception):
+            """Exception raised to interrupt the current request and return to prompt."""
+            pass
         
-        while True:
-            try:
-                # Show session context if we have history
-                if session_history:
-                    console.print(f"[dim]Session: {len(session_history)} task(s) | {run_count} run(s)[/dim]")
-                
-                # Get user input
-                query = Prompt.ask("[bold cyan]What would you like to do?[/bold cyan]")
-                
-                if not query.strip():
+        class SessionExit(Exception):
+            """Exception raised to exit the session immediately (Ctrl+C)."""
+            pass
+        
+        def handle_ctrl_z(signum, frame):
+            """Handle Ctrl+Z - stop current operation, return to prompt."""
+            nonlocal request_interrupted
+            
+            # Set interrupt flag on the handler - this will be checked in the loop
+            handler.interrupt()
+            
+            # If DoHandler has an active process, stop it
+            if handler._do_handler and handler._do_handler._current_process:
+                try:
+                    handler._do_handler._current_process.terminate()
+                    handler._do_handler._current_process.wait(timeout=1)
+                except:
+                    try:
+                        handler._do_handler._current_process.kill()
+                    except:
+                        pass
+                handler._do_handler._current_process = None
+            
+            # If we're processing a request, interrupt it immediately
+            if processing_request:
+                request_interrupted = True
+                console.print()
+                console.print(f"[yellow]⚠ Ctrl+Z - Stopping current operation...[/yellow]")
+                # Raise exception to break out and return to prompt
+                raise SessionInterrupt("Interrupted by Ctrl+Z")
+            else:
+                # Not processing anything, just inform the user
+                console.print()
+                console.print(f"[dim]Ctrl+Z - Type 'exit' to end the session[/dim]")
+        
+        def handle_ctrl_c(signum, frame):
+            """Handle Ctrl+C - exit the session immediately."""
+            # Stop any active process first
+            if handler._do_handler and handler._do_handler._current_process:
+                try:
+                    handler._do_handler._current_process.terminate()
+                    handler._do_handler._current_process.wait(timeout=1)
+                except:
+                    try:
+                        handler._do_handler._current_process.kill()
+                    except:
+                        pass
+                handler._do_handler._current_process = None
+            
+            console.print()
+            console.print("[cyan]👋 Session ended (Ctrl+C).[/cyan]")
+            raise SessionExit("Exited by Ctrl+C")
+        
+        # Set up signal handlers for the entire session
+        # Ctrl+Z (SIGTSTP) -> stop current operation, return to prompt
+        # Ctrl+C (SIGINT) -> exit session immediately
+        original_sigtstp = signal.signal(signal.SIGTSTP, handle_ctrl_z)
+        original_sigint = signal.signal(signal.SIGINT, handle_ctrl_c)
+        
+        try:
+            console.print()
+            console.print(Panel(
+                "[bold cyan]🚀 Cortex Interactive Session[/bold cyan]\n\n"
+                f"[dim]Session ID: {session_id[:30]}...[/dim]\n\n"
+                "Type what you want to do and Cortex will help you.\n"
+                "Commands will be shown for approval before execution.\n\n"
+                "[dim]Examples:[/dim]\n"
+                "  • install docker and run nginx\n"
+                "  • setup a postgresql database\n"
+                "  • configure nginx to proxy port 3000\n"
+                "  • check system resources\n\n"
+                "[dim]Type 'exit' or 'quit' to end the session.[/dim]\n"
+                "[dim]Press Ctrl+Z to stop current operation | Ctrl+C to exit immediately[/dim]",
+                title="[bold green]Welcome[/bold green]",
+                border_style="cyan",
+            ))
+            console.print()
+            
+            session_history = []  # Track what was done in this session
+            run_count = 0
+            
+            while True:
+                try:
+                    # Show compact session status (not the full history panel)
+                    if session_history:
+                        console.print(f"[dim]Session: {len(session_history)} task(s) | {run_count} run(s) | Type 'history' to see details[/dim]")
+                    
+                    # Get user input
+                    query = Prompt.ask("[bold cyan]What would you like to do?[/bold cyan]")
+                    
+                    if not query.strip():
+                        continue
+                    
+                    # Check for exit
+                    if query.lower().strip() in ["exit", "quit", "bye", "q"]:
+                        db.end_session(session_id)
+                        console.print()
+                        console.print(f"[cyan]👋 Session ended ({run_count} runs). Run 'cortex do history' to see past runs.[/cyan]")
+                        break
+                    
+                    # Check for help
+                    if query.lower().strip() in ["help", "?"]:
+                        console.print()
+                        console.print("[bold]Available commands:[/bold]")
+                        console.print("  [green]exit[/green], [green]quit[/green] - End the session")
+                        console.print("  [green]history[/green] - Show session history")
+                        console.print("  [green]clear[/green] - Clear session history")
+                        console.print("  Or type any request in natural language!")
+                        console.print()
+                        continue
+                    
+                    # Check for history
+                    if query.lower().strip() == "history":
+                        if session_history:
+                            from rich.table import Table
+                            from rich.panel import Panel
+                            
+                            console.print()
+                            table = Table(
+                                show_header=True, 
+                                header_style="bold cyan",
+                                title=f"[bold]Session History[/bold]",
+                                title_style="bold",
+                            )
+                            table.add_column("#", style="dim", width=3)
+                            table.add_column("Query", style="white", max_width=45)
+                            table.add_column("Status", justify="center", width=8)
+                            table.add_column("Commands", justify="center", width=10)
+                            table.add_column("Run ID", style="dim", max_width=20)
+                            
+                            for i, item in enumerate(session_history, 1):
+                                status = "[green]✓ Success[/green]" if item.get("success") else "[red]✗ Failed[/red]"
+                                query_short = item['query'][:42] + "..." if len(item['query']) > 42 else item['query']
+                                cmd_count = str(item.get('commands_count', 0)) if item.get('success') else "-"
+                                run_id = item.get('run_id', '-')[:18] + "..." if item.get('run_id') and len(item.get('run_id', '')) > 18 else item.get('run_id', '-')
+                                table.add_row(str(i), query_short, status, cmd_count, run_id)
+                            
+                            console.print(table)
+                            console.print()
+                            console.print(f"[dim]Total: {len(session_history)} tasks | {run_count} runs | Session: {session_id[:20]}...[/dim]")
+                            console.print()
+                        else:
+                            console.print("[dim]No tasks completed yet.[/dim]")
+                        continue
+                    
+                    # Check for clear
+                    if query.lower().strip() == "clear":
+                        session_history.clear()
+                        console.print("[dim]Session history cleared.[/dim]")
+                        continue
+                    
+                    # Update session with query
+                    db.update_session(session_id, query=query)
+                    
+                    # Process the query
+                    console.print()
+                    processing_request = True
+                    request_interrupted = False
+                    handler.reset_interrupt()  # Reset interrupt flag before new request
+                    
+                    try:
+                        answer = handler.ask(query)
+                        
+                        # Check if request was interrupted
+                        if request_interrupted:
+                            console.print("[yellow]⚠ Request was interrupted[/yellow]")
+                            session_history.append({
+                                "query": query,
+                                "success": False,
+                                "error": "Interrupted by user",
+                            })
+                            continue
+                        
+                        # Get the run_id and command count if one was created
+                        run_id = None
+                        commands_count = 0
+                        if handler._do_handler and handler._do_handler.current_run:
+                            run_id = handler._do_handler.current_run.run_id
+                            # Count commands from the run
+                            if handler._do_handler.current_run.commands:
+                                commands_count = len(handler._do_handler.current_run.commands)
+                            run_count += 1
+                            db.update_session(session_id, increment_runs=True)
+                        
+                        # Track in session history
+                        session_history.append({
+                            "query": query,
+                            "success": True,
+                            "answer": answer[:100] if answer else "",
+                            "run_id": run_id,
+                            "commands_count": commands_count,
+                        })
+                        
+                        # Print response if it's informational (filter out JSON)
+                        if answer and not answer.startswith("USER_DECLINED"):
+                            # Don't print raw JSON or processing messages
+                            if not (answer.strip().startswith('{') or 
+                                    "I'm processing your request" in answer or
+                                    "I have a plan to execute" in answer):
+                                console.print(answer)
+                        
+                    except SessionInterrupt:
+                        # Ctrl+Z/Ctrl+C pressed - return to prompt immediately
+                        console.print()
+                        session_history.append({
+                            "query": query,
+                            "success": False,
+                            "error": "Interrupted by user",
+                        })
+                        continue  # Go back to "What would you like to do?" prompt
+                    except Exception as e:
+                        if request_interrupted:
+                            console.print("[yellow]⚠ Request was interrupted[/yellow]")
+                        else:
+                            # Show user-friendly error without internal details
+                            error_msg = str(e)
+                            if isinstance(e, AttributeError):
+                                console.print("[yellow]⚠ Something went wrong. Please try again.[/yellow]")
+                                # Log the actual error for debugging
+                                import logging
+                                logging.debug(f"Internal error: {e}")
+                            else:
+                                console.print(f"[red]⚠ {error_msg}[/red]")
+                        session_history.append({
+                            "query": query,
+                            "success": False,
+                            "error": "Interrupted" if request_interrupted else str(e),
+                        })
+                    finally:
+                        processing_request = False
+                        request_interrupted = False
+                    
+                    console.print()
+                    
+                except SessionInterrupt:
+                    # Ctrl+Z - just return to prompt
+                    console.print()
                     continue
-                
-                # Check for exit
-                if query.lower().strip() in ["exit", "quit", "bye", "q"]:
+                except SessionExit:
+                    # Ctrl+C - exit session immediately
+                    db.end_session(session_id)
+                    break
+                except (KeyboardInterrupt, EOFError):
+                    # Fallback for any other interrupts
                     db.end_session(session_id)
                     console.print()
-                    console.print(f"[cyan]👋 Session ended ({run_count} runs). Run 'cortex do history' to see past runs.[/cyan]")
+                    console.print("[cyan]👋 Session ended.[/cyan]")
                     break
-                
-                # Check for help
-                if query.lower().strip() in ["help", "?"]:
-                    console.print()
-                    console.print("[bold]Available commands:[/bold]")
-                    console.print("  [green]exit[/green], [green]quit[/green] - End the session")
-                    console.print("  [green]history[/green] - Show session history")
-                    console.print("  [green]clear[/green] - Clear session history")
-                    console.print("  Or type any request in natural language!")
-                    console.print()
-                    continue
-                
-                # Check for history
-                if query.lower().strip() == "history":
-                    if session_history:
-                        console.print()
-                        console.print("[bold]Session history:[/bold]")
-                        for i, item in enumerate(session_history, 1):
-                            status = "✓" if item.get("success") else "✗"
-                            run_info = f" (run: {item.get('run_id', 'N/A')[:15]})" if item.get("run_id") else ""
-                            console.print(f"  {i}. [{status}] {item['query'][:50]}...{run_info}")
-                        console.print()
-                    else:
-                        console.print("[dim]No tasks completed yet.[/dim]")
-                    continue
-                
-                # Check for clear
-                if query.lower().strip() == "clear":
-                    session_history.clear()
-                    console.print("[dim]Session history cleared.[/dim]")
-                    continue
-                
-                # Update session with query
-                db.update_session(session_id, query=query)
-                
-                # Process the query
-                console.print()
-                try:
-                    answer = handler.ask(query)
-                    
-                    # Get the run_id if one was created
-                    run_id = None
-                    if handler._do_handler and handler._do_handler.current_run:
-                        run_id = handler._do_handler.current_run.run_id
-                        run_count += 1
-                        db.update_session(session_id, increment_runs=True)
-                    
-                    # Track in session history
-                    session_history.append({
-                        "query": query,
-                        "success": True,
-                        "answer": answer[:100] if answer else "",
-                        "run_id": run_id,
-                    })
-                    
-                    # Print response if it's informational
-                    if answer and not answer.startswith("USER_DECLINED"):
-                        console.print(answer)
-                    
-                except Exception as e:
-                    console.print(f"[red]Error: {e}[/red]")
-                    session_history.append({
-                        "query": query,
-                        "success": False,
-                        "error": str(e),
-                    })
-                
-                console.print()
-                
-            except KeyboardInterrupt:
-                db.end_session(session_id)
-                console.print()
-                console.print("[cyan]👋 Session ended.[/cyan]")
-                break
-            except EOFError:
-                db.end_session(session_id)
-                console.print()
-                console.print("[cyan]👋 Session ended.[/cyan]")
-                break
+        
+        finally:
+            # Always restore signal handlers when session ends
+            signal.signal(signal.SIGTSTP, original_sigtstp)
+            signal.signal(signal.SIGINT, original_sigint)
         
         return 0
 
@@ -1895,6 +2045,163 @@ class CortexCLI:
         console.print("  cortex info What Python packages are installed?")
         return 0
 
+    # --- Watch Command ---
+    def watch_cmd(self, args: argparse.Namespace) -> int:
+        """Manage terminal watching for manual intervention mode."""
+        from rich.panel import Panel
+        from cortex.do_runner.terminal import TerminalMonitor
+        
+        monitor = TerminalMonitor(use_llm=False)
+        system_wide = getattr(args, "system", False)
+        as_service = getattr(args, "service", False)
+        
+        if getattr(args, "install", False):
+            if as_service:
+                # Install as systemd service
+                console.print("\n[bold cyan]🔧 Installing Cortex Watch Service[/bold cyan]")
+                console.print("[dim]This will create a systemd user service that runs automatically[/dim]\n")
+                
+                from cortex.watch_service import install_service
+                success, msg = install_service()
+                console.print(msg)
+                return 0 if success else 1
+            elif system_wide:
+                console.print("\n[bold cyan]🔧 Installing System-Wide Terminal Watch Hook[/bold cyan]")
+                console.print("[dim]This will install to /etc/profile.d/ (requires sudo)[/dim]\n")
+                success, msg = monitor.setup_system_wide_watch()
+                if success:
+                    console.print(f"[green]{msg}[/green]")
+                    console.print("\n[bold green]✓ All new terminals will automatically have Cortex watching![/bold green]")
+                else:
+                    console.print(f"[red]✗ {msg}[/red]")
+                    return 1
+            else:
+                console.print("\n[bold cyan]🔧 Installing Terminal Watch Hook[/bold cyan]\n")
+                success, msg = monitor.setup_auto_watch(permanent=True)
+                if success:
+                    console.print(f"[green]✓ {msg}[/green]")
+                    console.print("\n[yellow]Note: New terminals will have the hook automatically.[/yellow]")
+                    console.print("[yellow]For existing terminals, run:[/yellow]")
+                    console.print(f"[green]source ~/.cortex/watch_hook.sh[/green]")
+                    console.print("\n[dim]Tip: For automatic activation in ALL terminals, run:[/dim]")
+                    console.print("[cyan]cortex watch --install --system[/cyan]")
+                else:
+                    console.print(f"[red]✗ {msg}[/red]")
+                    return 1
+            return 0
+        
+        if getattr(args, "uninstall", False):
+            if as_service:
+                console.print("\n[bold cyan]🔧 Removing Cortex Watch Service[/bold cyan]\n")
+                from cortex.watch_service import uninstall_service
+                success, msg = uninstall_service()
+            elif system_wide:
+                console.print("\n[bold cyan]🔧 Removing System-Wide Terminal Watch Hook[/bold cyan]\n")
+                success, msg = monitor.uninstall_system_wide_watch()
+            else:
+                console.print("\n[bold cyan]🔧 Removing Terminal Watch Hook[/bold cyan]\n")
+                success, msg = monitor.remove_auto_watch()
+            if success:
+                console.print(f"[green]{msg}[/green]")
+            else:
+                console.print(f"[red]✗ {msg}[/red]")
+                return 1
+            return 0
+        
+        if getattr(args, "test", False):
+            console.print("\n[bold cyan]🧪 Testing Terminal Monitoring[/bold cyan]\n")
+            monitor.test_monitoring()
+            return 0
+        
+        if getattr(args, "status", False):
+            console.print("\n[bold cyan]📊 Terminal Watch Status[/bold cyan]\n")
+            
+            from pathlib import Path
+            bashrc = Path.home() / ".bashrc"
+            zshrc = Path.home() / ".zshrc"
+            source_file = Path.home() / ".cortex" / "watch_hook.sh"
+            watch_log = Path.home() / ".cortex" / "terminal_watch.log"
+            system_hook = Path("/etc/profile.d/cortex-watch.sh")
+            service_file = Path.home() / ".config" / "systemd" / "user" / "cortex-watch.service"
+            
+            console.print("[bold]Service Status:[/bold]")
+            
+            # Check systemd service
+            if service_file.exists():
+                try:
+                    result = subprocess.run(
+                        ["systemctl", "--user", "is-active", "cortex-watch.service"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    is_active = result.stdout.strip() == "active"
+                    if is_active:
+                        console.print("  [bold green]✓ SYSTEMD SERVICE RUNNING[/bold green]")
+                        console.print("    [dim]Automatic terminal monitoring active[/dim]")
+                    else:
+                        console.print("  [yellow]○ Systemd service installed but not running[/yellow]")
+                        console.print("    [dim]Run: systemctl --user start cortex-watch[/dim]")
+                except Exception:
+                    console.print("  [yellow]○ Systemd service installed (status unknown)[/yellow]")
+            else:
+                console.print("  [dim]○ Systemd service not installed[/dim]")
+                console.print("    [dim]Run: cortex watch --install --service (recommended)[/dim]")
+            
+            console.print()
+            console.print("[bold]Hook Status:[/bold]")
+            
+            # System-wide check
+            if system_hook.exists():
+                console.print("  [green]✓ System-wide hook installed[/green]")
+            else:
+                console.print("  [dim]○ System-wide hook not installed[/dim]")
+            
+            # User-level checks
+            if bashrc.exists() and "Cortex Terminal Watch Hook" in bashrc.read_text():
+                console.print("  [green]✓ Hook installed in .bashrc[/green]")
+            else:
+                console.print("  [dim]○ Not installed in .bashrc[/dim]")
+            
+            if zshrc.exists() and "Cortex Terminal Watch Hook" in zshrc.read_text():
+                console.print("  [green]✓ Hook installed in .zshrc[/green]")
+            else:
+                console.print("  [dim]○ Not installed in .zshrc[/dim]")
+            
+            console.print("\n[bold]Watch Log:[/bold]")
+            if watch_log.exists():
+                size = watch_log.stat().st_size
+                lines = len(watch_log.read_text().strip().split('\n')) if size > 0 else 0
+                console.print(f"  [green]✓ Log file exists: {watch_log}[/green]")
+                console.print(f"  [dim]  Size: {size} bytes, {lines} commands logged[/dim]")
+            else:
+                console.print(f"  [dim]○ No log file yet (created when commands are run)[/dim]")
+            
+            return 0
+        
+        # Default: show help
+        console.print()
+        console.print(Panel(
+            "[bold cyan]Terminal Watch[/bold cyan] - Real-time monitoring for manual intervention mode\n\n"
+            "When Cortex enters manual intervention mode, it watches your other terminals\n"
+            "to provide real-time feedback and AI-powered suggestions.\n\n"
+            "[bold]Commands:[/bold]\n"
+            "  [cyan]cortex watch --install --service[/cyan] Install as systemd service (RECOMMENDED)\n"
+            "  [cyan]cortex watch --install --system[/cyan]  Install system-wide hook (requires sudo)\n"
+            "  [cyan]cortex watch --install[/cyan]           Install hook to .bashrc/.zshrc\n"
+            "  [cyan]cortex watch --uninstall --service[/cyan] Remove systemd service\n"
+            "  [cyan]cortex watch --status[/cyan]            Show installation status\n"
+            "  [cyan]cortex watch --test[/cyan]              Test monitoring setup\n\n"
+            "[bold green]Recommended Setup:[/bold green]\n"
+            "  Run [green]cortex watch --install --service[/green]\n\n"
+            "  This creates a background service that:\n"
+            "  • Starts automatically on login\n"
+            "  • Restarts if it crashes\n"
+            "  • Monitors ALL terminal activity\n"
+            "  • No manual setup in each terminal!",
+            title="[green]🔍 Cortex Watch[/green]",
+            border_style="cyan",
+        ))
+        return 0
+
     # --- Import Dependencies Command ---
     def import_deps(self, args: argparse.Namespace) -> int:
         """Import and install dependencies from package manager files.
@@ -2526,6 +2833,16 @@ def main():
     do_protected_parser.add_argument("--list", action="store_true", help="List all protected paths")
     # --------------------------
 
+    # --- Watch Command (terminal monitoring setup) ---
+    watch_parser = subparsers.add_parser("watch", help="Manage terminal watching for manual intervention mode")
+    watch_parser.add_argument("--install", action="store_true", help="Install terminal watch hook to .bashrc/.zshrc")
+    watch_parser.add_argument("--uninstall", action="store_true", help="Remove terminal watch hook from shell configs")
+    watch_parser.add_argument("--system", action="store_true", help="Install/uninstall system-wide (requires sudo)")
+    watch_parser.add_argument("--service", action="store_true", help="Install/uninstall as systemd service (recommended)")
+    watch_parser.add_argument("--status", action="store_true", help="Show terminal watch status")
+    watch_parser.add_argument("--test", action="store_true", help="Test terminal monitoring")
+    # --------------------------
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2578,6 +2895,8 @@ def main():
             return cli.do_cmd(args)
         elif args.command == "info":
             return cli.info_cmd(args)
+        elif args.command == "watch":
+            return cli.watch_cmd(args)
         else:
             parser.print_help()
             return 1
@@ -2586,6 +2905,13 @@ def main():
         return 130
     except (ValueError, ImportError, OSError) as e:
         print(f"❌ Error: {e}", file=sys.stderr)
+        return 1
+    except AttributeError as e:
+        # Internal errors - show friendly message
+        print("❌ Something went wrong. Please try again.", file=sys.stderr)
+        if "--verbose" in sys.argv or "-v" in sys.argv:
+            import traceback
+            traceback.print_exc()
         return 1
     except Exception as e:
         print(f"❌ Unexpected error: {e}", file=sys.stderr)

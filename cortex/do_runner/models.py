@@ -17,6 +17,7 @@ class CommandStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     NEEDS_REPAIR = "needs_repair"
+    INTERRUPTED = "interrupted"  # Command stopped by Ctrl+Z/Ctrl+C
 
 
 class RunMode(str, Enum):
