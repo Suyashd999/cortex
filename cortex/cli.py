@@ -1759,8 +1759,7 @@ class CortexCLI:
                     console.print(f"   [dim]Purpose:[/dim] {cmd.purpose}")
                     console.print(f"   [dim]Status:[/dim] {cmd.status.value} | [dim]Duration:[/dim] {cmd.duration_seconds:.2f}s")
                     if cmd.output:
-                        output_truncated = cmd.output[:250] + "..." if len(cmd.output) > 250 else cmd.output
-                        console.print(f"   [dim]Output:[/dim] {output_truncated}")
+                        console.print(f"   [dim]Output:[/dim] {cmd.output}")
                     if cmd.error:
                         console.print(f"   [red]Error:[/red] {cmd.error}")
             

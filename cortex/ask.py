@@ -651,14 +651,13 @@ class AskHandler:
                     if line.strip() and not line.strip().startswith('#!'):
                         readable_lines.append(line)
             if readable_lines:
-                clean_answer = '\n'.join(readable_lines[:20])  # Limit to 20 lines
+                clean_answer = '\n'.join(readable_lines)
         
         self._console.print()
         
         # Query section
-        q_display = question[:80] + "..." if len(question) > 80 else question
         self._console.print(Panel(
-            f"[bold]{q_display}[/bold]",
+            f"[bold]{question}[/bold]",
             title="[bold white on blue] 🔍 Query [/bold white on blue]",
             title_align="left",
             border_style="blue",
@@ -676,11 +675,8 @@ class AskHandler:
             )
             info_table.add_column("", style="dim")
             
-            for cmd in commands_run[:4]:
-                cmd_display = cmd[:60] + "..." if len(cmd) > 60 else cmd
-                info_table.add_row(f"$ {cmd_display}")
-            if len(commands_run) > 4:
-                info_table.add_row(f"[dim]... and {len(commands_run) - 4} more commands[/dim]")
+            for cmd in commands_run:
+                info_table.add_row(f"$ {cmd}")
             
             self._console.print(Panel(
                 info_table,
@@ -692,14 +688,11 @@ class AskHandler:
         
         # Answer section - make it prominent
         if clean_answer.strip():
-            # Truncate very long answers
-            if len(clean_answer) > 800:
-                display_answer = clean_answer[:800] + "\n\n[dim]... (answer truncated)[/dim]"
-            else:
-                display_answer = clean_answer
+            # Show full answer with markdown rendering
+            from rich.markdown import Markdown
             
             self._console.print(Panel(
-                display_answer,
+                Markdown(clean_answer),
                 title="[bold white on green] 💡 Answer [/bold white on green]",
                 title_align="left",
                 border_style="green",
@@ -1471,9 +1464,16 @@ For running a read-only command:
             # Build prompt with history
             user_prompt = self._build_iteration_prompt(question, history)
             
-            # Call LLM
+            # Call LLM with loading spinner
+            from rich.status import Status
             try:
-                response_text = self._call_llm(system_prompt, user_prompt)
+                spinner_text = "[cyan]Generating commands...[/cyan]" if self.do_mode else "[cyan]Thinking...[/cyan]"
+                if iteration > 0:
+                    spinner_text = "[cyan]Analyzing and planning next steps...[/cyan]"
+                
+                with Status(spinner_text, spinner="dots"):
+                    response_text = self._call_llm(system_prompt, user_prompt)
+                
                 # Check for interrupt after LLM call
                 if self._interrupted:
                     self._interrupted = False
@@ -1596,7 +1596,9 @@ For running a read-only command:
                         if stdout and output_lines > 0:
                             self._show_expandable_output(loop_console, stdout, command)
                     else:
-                        loop_console.print(f"[yellow]   ⚠ Command failed: {stderr[:100]}[/yellow]")
+                        loop_console.print(f"[yellow]   ⚠ Command failed:[/yellow]")
+                        for line in stderr.strip().split('\n'):
+                            loop_console.print(f"[dim]   {line}[/dim]")
                 
                 if self.debug:
                     if success:
@@ -1670,16 +1672,38 @@ For running a read-only command:
         # Analyze for protected paths
         analyzed = self._do_handler.analyze_commands_for_protected_paths(commands)
         
-        # Show reasoning
+        # Show reasoning in a nice panel
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich import box
+        
         console.print()
-        console.print(f"[bold cyan]🤖 Cortex Analysis:[/bold cyan] {parsed.reasoning}")
+        console.print(Panel(
+            f"[white]{parsed.reasoning}[/white]",
+            title="[bold cyan]🤖 Cortex Analysis[/bold cyan]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 2),
+        ))
         console.print()
         
-        # Show task tree preview
-        console.print("[dim]📋 Planned tasks:[/dim]")
+        # Show task tree preview as a table
+        task_table = Table(
+            show_header=False,
+            box=box.SIMPLE,
+            padding=(0, 1),
+            expand=False,
+        )
+        task_table.add_column("", style="dim cyan", width=3)
+        task_table.add_column("Command", style="cyan")
+        task_table.add_column("", style="dim yellow")
+        
         for i, (cmd, purpose, protected) in enumerate(analyzed, 1):
-            protected_note = f" [yellow](protected: {', '.join(protected)})[/yellow]" if protected else ""
-            console.print(f"[dim]   {i}. {cmd[:60]}...{protected_note}[/dim]")
+            protected_note = f"⚠ {', '.join(protected)}" if protected else ""
+            task_table.add_row(f"{i}.", cmd, protected_note)
+        
+        console.print("[bold]📋 Planned tasks:[/bold]")
+        console.print(task_table)
         console.print()
         
         # Request user confirmation
@@ -1715,7 +1739,7 @@ For running a read-only command:
                 for f in failures:
                     failure_summary.append({
                         "command": f.command,
-                        "error": f.error[:500] if f.error else "Unknown error",
+                        "error": f.error if f.error else "Unknown error",
                         "purpose": f.purpose,
                     })
                 
@@ -1815,7 +1839,7 @@ For running a read-only command:
             })
             
             console.print()
-            console.print(f"[cyan]🔄 Processing your request: {user_response[:50]}{'...' if len(user_response) > 50 else ''}[/cyan]")
+            console.print(f"[cyan]🔄 Processing your request: {user_response}[/cyan]")
             
             # Continue the loop with user's new input as additional context
             # The LLM will see the history and the user's feedback

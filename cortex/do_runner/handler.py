@@ -113,21 +113,23 @@ class DoHandler:
             signal.signal(signal.SIGINT, self._original_sigint)
     
     def _handle_interrupt(self, signum, frame):
-        """Handle Ctrl+Z (SIGTSTP) or Ctrl+C (SIGINT) to stop current command only.
+        """Handle Ctrl+Z (SIGTSTP) or Ctrl+C (SIGINT).
         
-        This does NOT exit the session - it only stops the currently executing command.
-        The session continues so the user can decide what to do next.
+        - Ctrl+Z (SIGTSTP): Stop current command, stay in session
+        - Ctrl+C (SIGINT): If command is running, stop it. If not, exit session.
         """
         self._interrupted = True
-        # Store the interrupted command for potential retry
-        self._interrupted_command = self._current_command
+        is_ctrl_c = (signum == signal.SIGINT)
         signal_name = "Ctrl+Z" if signum == signal.SIGTSTP else "Ctrl+C"
-        
-        console.print()
-        console.print(f"[yellow]⚠ {signal_name} detected - Stopping current command...[/yellow]")
         
         # Kill current subprocess if running
         if self._current_process and self._current_process.poll() is None:
+            # Store the interrupted command for potential retry
+            self._interrupted_command = self._current_command
+            
+            console.print()
+            console.print(f"[yellow]⚠ {signal_name} detected - Stopping current command...[/yellow]")
+            
             try:
                 self._current_process.terminate()
                 # Give it a moment to terminate gracefully
@@ -138,9 +140,16 @@ class DoHandler:
                 console.print(f"[yellow]   Stopped: {self._current_command}[/yellow]")
             except Exception as e:
                 console.print(f"[dim]   Error stopping process: {e}[/dim]")
+            
+            # For Ctrl+Z, stay in session. For Ctrl+C, continue but mark interrupted.
+            return
         
-        # Note: We do NOT raise KeyboardInterrupt here
-        # The session continues - only the current command is stopped
+        # No command running - Ctrl+C should exit the session
+        if is_ctrl_c:
+            # Restore original signal handlers before raising
+            self._restore_signal_handlers()
+            # Re-raise to exit the session
+            raise KeyboardInterrupt()
     
     def _track_command_start(self, command: str, process: subprocess.Popen | None = None):
         """Track when a command starts executing."""
@@ -302,9 +311,9 @@ class DoHandler:
         
         all_protected = []
         for i, (cmd, purpose, protected) in enumerate(commands, 1):
-            # Truncate long commands for display
-            cmd_display = cmd if len(cmd) <= 60 else cmd[:57] + "..."
-            purpose_display = purpose if len(purpose) <= 50 else purpose[:47] + "..."
+            # Show full command and purpose
+            cmd_display = cmd
+            purpose_display = purpose
             
             # Add protected path indicator
             if protected:
@@ -750,20 +759,16 @@ class DoHandler:
         from rich.panel import Panel
         from rich.text import Text
         
+        from rich.status import Status
+        
         for i, (cmd, purpose, protected) in enumerate(commands, 1):
-            # Create a visually distinct panel for each command
-            cmd_header = Text()
-            cmd_header.append(f"[{i}/{len(commands)}] ", style="bold white on blue")
-            cmd_header.append(f" {cmd}", style="bold cyan")
+            # Compact command header
+            cmd_display = cmd[:65] + "..." if len(cmd) > 65 else cmd
+            purpose_display = purpose[:60] + "..." if len(purpose) > 60 else purpose
             
             console.print()
-            console.print(Panel(
-                f"[bold cyan]{cmd}[/bold cyan]\n[dim]└─ {purpose}[/dim]",
-                title=f"[bold white] Command {i}/{len(commands)} [/bold white]",
-                title_align="left",
-                border_style="blue",
-                padding=(0, 1),
-            ))
+            console.print(f"[bold cyan]● {cmd_display}[/bold cyan]")
+            console.print(f"  [dim]↳ {purpose_display}[/dim]")
             
             file_check = self._file_analyzer.check_file_exists_and_usefulness(cmd, purpose, user_query)
             
@@ -780,23 +785,16 @@ class DoHandler:
             start_time = time.time()
             needs_sudo = self._needs_sudo(cmd, protected)
             
-            success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
+            # Show spinner while executing
+            with Status(f"  [dim]Running...[/dim]", spinner="dots"):
+                success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
             
             if not success:
                 diagnosis = self._diagnoser.diagnose_error(cmd, stderr)
                 
-                # Create error panel for visual grouping
-                error_info = (
-                    f"[bold red]⚠ {diagnosis['description']}[/bold red]\n"
-                    f"[dim]Type: {diagnosis['error_type']} | Category: {diagnosis.get('category', 'unknown')}[/dim]"
-                )
-                console.print(Panel(
-                    error_info,
-                    title="[bold red] ❌ Error Detected [/bold red]",
-                    title_align="left",
-                    border_style="red",
-                    padding=(0, 1),
-                ))
+                # Show concise error message
+                error_desc = diagnosis.get('description', stderr[:100])
+                console.print(f"  [red]✗ {error_desc}[/red]")
                 
                 # Check if this is a login/credential required error
                 if diagnosis.get("category") == "login_required":
@@ -829,7 +827,7 @@ class DoHandler:
                             ))
                         else:
                             console.print(Panel(
-                                f"[bold yellow]Command still failed after login[/bold yellow]\n[dim]{stderr[:100]}[/dim]",
+                                f"[bold yellow]Command still failed after login[/bold yellow]\n[dim]{stderr}[/dim]",
                                 border_style="yellow",
                                 padding=(0, 1),
                             ))
@@ -902,7 +900,7 @@ class DoHandler:
                     self._show_expandable_output(stdout, cmd)
             else:
                 console.print(Panel(
-                    f"[bold red]✗ Failed[/bold red]\n[dim]{stderr[:200]}[/dim]",
+                    f"[bold red]✗ Failed[/bold red]\n[dim]{stderr}[/dim]",
                     border_style="red",
                     padding=(0, 1),
                 ))
@@ -1843,58 +1841,58 @@ class DoHandler:
                 from rich.panel import Panel
                 
                 executed_in_session = []
+                command_outputs = []  # Collect outputs for summary
+                total = len(do_commands)
                 for idx, cmd_info in enumerate(do_commands, 1):
                     cmd = cmd_info.get("command", "")
                     purpose = cmd_info.get("purpose", "Execute command")
                     needs_sudo = cmd_info.get("requires_sudo", False) or self._needs_sudo(cmd, [])
                     
-                    # Create visual grouping for each command
+                    # Compact command header
                     console.print()
-                    console.print(Panel(
-                        f"[bold cyan]{cmd}[/bold cyan]\n[dim]└─ {purpose}[/dim]",
-                        title=f"[bold] Command {idx}/{len(do_commands)} [/bold]",
-                        title_align="left",
-                        border_style="blue",
-                        padding=(0, 1),
-                    ))
+                    console.print(f"[bold cyan]({idx}/{total})[/bold cyan] {cmd}")
+                    console.print(f"    [dim]└─ {purpose}[/dim]")
                     
-                    success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
+                    # Show spinner while executing
+                    from rich.status import Status
+                    with Status(f"    [dim]Running...[/dim]", spinner="dots"):
+                        success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
                     
                     if success:
-                        console.print(Panel(
-                            f"[bold green]✓ Success[/bold green]",
-                            border_style="green",
-                            padding=(0, 1),
-                            expand=False,
-                        ))
+                        console.print(f"    [green]✓ Success[/green]")
                         if stdout:
-                            output_preview = stdout[:300] + ('...' if len(stdout) > 300 else '')
-                            console.print(f"[dim]{output_preview}[/dim]")
+                            # Show full output
+                            for line in stdout.strip().split('\n'):
+                                console.print(f"    [dim]{line}[/dim]")
+                            command_outputs.append({"cmd": cmd, "output": stdout, "success": True})
                         executed_in_session.append(cmd)
                     else:
-                        console.print(Panel(
-                            f"[bold red]✗ Failed[/bold red]\n[dim]{stderr[:150]}[/dim]",
-                            border_style="red",
-                            padding=(0, 1),
-                        ))
+                        console.print(f"    [red]✗ Failed:[/red]")
+                        for line in stderr.strip().split('\n'):
+                            console.print(f"    [dim]{line}[/dim]")
+                        command_outputs.append({"cmd": cmd, "output": stderr, "success": False})
                         
                         # Offer to diagnose and fix
-                        if Confirm.ask("Try to auto-fix?", default=True):
+                        if Confirm.ask("    Try to auto-fix?", default=True):
                             diagnosis = self._diagnoser.diagnose_error(cmd, stderr)
                             fixed, msg, _ = self._auto_fixer.auto_fix_error(cmd, stderr, diagnosis)
                             if fixed:
-                                console.print(Panel(
-                                    f"[bold green]✓ Fixed:[/bold green] {msg}",
-                                    border_style="green",
-                                    padding=(0, 1),
-                                    expand=False,
-                                ))
+                                console.print(f"    [green]✓ Fixed:[/green] {msg}")
                                 executed_in_session.append(cmd)
+                
+                # Store outputs in context for summary generation
+                context["last_outputs"] = [o.get("output", "") for o in command_outputs]
+                context["command_results"] = command_outputs
                 
                 # Track executed commands in context for suggestion generation
                 if "executed_commands" not in context:
                     context["executed_commands"] = []
                 context["executed_commands"].extend(executed_in_session)
+                
+                # Generate a summary after executing multiple commands
+                if len(do_commands) >= 2 and self.llm_callback:
+                    console.print()
+                    self._generate_interactive_summary(request, do_commands, context)
                 
                 return True
             
@@ -1909,14 +1907,19 @@ class DoHandler:
                     console.print(f"   [dim]{reasoning}[/dim]")
                 
                 needs_sudo = self._needs_sudo(cmd, [])
-                success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
+                
+                # Show spinner while executing
+                from rich.status import Status
+                with Status(f"   [dim]Running...[/dim]", spinner="dots"):
+                    success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
                 
                 if success:
                     console.print(f"[green]✓ Success[/green]")
                     if stdout:
-                        console.print(f"[dim]{stdout[:500]}{'...' if len(stdout) > 500 else ''}[/dim]")
+                        console.print(f"[dim]{stdout}[/dim]")
                 else:
-                    console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+                    console.print(f"[red]✗ Failed:[/red]")
+                    console.print(f"[dim]{stderr}[/dim]")
                 
                 return True
             
@@ -1939,6 +1942,95 @@ class DoHandler:
             console.print(f"[yellow]⚠ Error processing request: {e}[/yellow]")
             # Fall back to pattern matching
             return self._handle_request_with_patterns(request, context, run)
+    
+    def _generate_interactive_summary(
+        self,
+        user_request: str,
+        commands_executed: list[dict],
+        context: dict,
+    ) -> None:
+        """Generate and display a summary after executing commands in interactive mode."""
+        from rich.panel import Panel
+        from rich.status import Status
+        
+        if not self.llm_callback:
+            return
+        
+        # Build a summary prompt with command results
+        prompt = f"""The user asked: "{user_request}"
+
+The following commands were executed with their outputs:
+"""
+        # Use actual command results from context if available
+        command_results = context.get("command_results", [])
+        if command_results:
+            for i, result in enumerate(command_results, 1):
+                cmd = result.get("cmd", "")
+                output = result.get("output", "")
+                success = result.get("success", True)
+                status = "SUCCESS" if success else "FAILED"
+                prompt += f"\n{i}. [{status}] {cmd}"
+                if output:
+                    # Include output but limit for very long outputs
+                    output_lines = output.strip().split('\n')
+                    if len(output_lines) > 20:
+                        # Include first 15 and last 5 lines for long outputs
+                        output_preview = '\n'.join(output_lines[:15] + ['...'] + output_lines[-5:])
+                    else:
+                        output_preview = output.strip()
+                    prompt += f"\n   Output:\n   {output_preview}"
+        else:
+            # Fallback to command info only
+            for i, cmd_info in enumerate(commands_executed, 1):
+                cmd = cmd_info.get("command", "")
+                purpose = cmd_info.get("purpose", "")
+                prompt += f"\n{i}. {cmd}"
+                if purpose:
+                    prompt += f"\n   Purpose: {purpose}"
+        
+        prompt += """
+
+Based on the commands executed and their outputs, provide:
+1. A brief summary of what was found or accomplished (2-3 sentences)
+2. Key findings or notable items the user should know about (use bullet points)
+3. Suggested next actions the user might want to take (2-3 numbered options)
+
+Keep the response concise and actionable. Do NOT include JSON in your response.
+Highlight any important warnings or issues found."""
+
+        try:
+            with Status("[cyan]Analyzing results...[/cyan]", spinner="dots"):
+                result = self.llm_callback(prompt)
+            
+            if result:
+                # Extract the answer
+                if isinstance(result, dict):
+                    answer = result.get("answer") or result.get("response") or result.get("reasoning") or ""
+                elif isinstance(result, str):
+                    answer = result
+                else:
+                    return
+                
+                answer = answer.strip()
+                
+                # Don't show JSON-like responses
+                if answer.startswith('{') or answer.startswith('['):
+                    return
+                
+                # Convert markdown to Rich markup
+                from rich.markdown import Markdown
+                
+                # Display the summary using Markdown rendering
+                console.print(Panel(
+                    Markdown(answer),
+                    title="[bold white on blue] 📊 Summary & Next Steps [/bold white on blue]",
+                    title_align="left",
+                    border_style="blue",
+                    padding=(1, 2),
+                ))
+        except Exception:
+            # Silently fail - summary is optional
+            pass
     
     def _handle_request_with_patterns(
         self,
@@ -1968,15 +2060,18 @@ class DoHandler:
             
             # Execute the command
             needs_sudo = self._needs_sudo(cmd, [])
-            success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
+            
+            from rich.status import Status
+            with Status(f"[dim]Running...[/dim]", spinner="dots"):
+                success, stdout, stderr = self._execute_single_command(cmd, needs_sudo)
             
             if success:
                 console.print(f"[green]✓ Success[/green]")
                 if stdout:
-                    output_preview = stdout[:500] + ('...' if len(stdout) > 500 else '')
-                    console.print(f"[dim]{output_preview}[/dim]")
+                    console.print(f"[dim]{stdout}[/dim]")
             else:
-                console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+                console.print(f"[red]✗ Failed:[/red]")
+                console.print(f"[dim]{stderr}[/dim]")
                 
                 # Offer to diagnose the error
                 if Confirm.ask("Would you like me to try to fix this?", default=True):
@@ -2445,10 +2540,11 @@ If you cannot generate a safe command, respond with: {{"error": "reason"}}"""
                 if success:
                     console.print(f"[green]✓ Success[/green]")
                     if stdout:
-                        console.print(f"[dim]{stdout[:500]}{'...' if len(stdout) > 500 else ''}[/dim]")
+                        console.print(f"[dim]{stdout}[/dim]")
                     self._interrupted_command = None  # Clear after successful retry
                 else:
-                    console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+                    console.print(f"[red]✗ Failed:[/red]")
+                    console.print(f"[dim]{stderr}[/dim]")
             else:
                 console.print("[yellow]No interrupted command to retry.[/yellow]")
         elif suggestion_type == "skip_and_continue":
@@ -2484,9 +2580,10 @@ If you cannot generate a safe command, respond with: {{"error": "reason"}}"""
             if success:
                 console.print(f"[green]✓ Success[/green]")
                 if stdout:
-                    console.print(f"[dim]{stdout[:500]}{'...' if len(stdout) > 500 else ''}[/dim]")
+                    console.print(f"[dim]{stdout}[/dim]")
             else:
-                console.print(f"[red]✗ Failed: {stderr[:200]}[/red]")
+                console.print(f"[red]✗ Failed:[/red]")
+                console.print(f"[dim]{stderr}[/dim]")
         elif "manual_commands" in suggestion:
             # Show manual commands
             console.print()
@@ -2605,15 +2702,18 @@ If you cannot generate a safe command, respond with: {{"error": "reason"}}"""
                     console.print()
                     console.print(f"[cyan]Running:[/cyan] {cmd}")
                     needs_sudo = cmd.strip().startswith("sudo")
-                    success, stdout, stderr = self._execute_single_command(cmd, needs_sudo=needs_sudo)
+                    
+                    from rich.status import Status
+                    with Status(f"[dim]Running test...[/dim]", spinner="dots"):
+                        success, stdout, stderr = self._execute_single_command(cmd, needs_sudo=needs_sudo)
                     if success:
                         console.print(f"[green]✓ {desc} - Passed[/green]")
                         if stdout:
-                            console.print(Panel(stdout[:500], title="[dim]Output[/dim]", border_style="dim"))
+                            console.print(Panel(stdout, title="[dim]Output[/dim]", border_style="dim"))
                     else:
                         console.print(f"[red]✗ {desc} - Failed[/red]")
                         if stderr:
-                            console.print(f"[dim red]{stderr[:200]}[/dim red]")
+                            console.print(f"[dim red]{stderr}[/dim red]")
         except (EOFError, KeyboardInterrupt):
             pass
     
@@ -2796,7 +2896,11 @@ if __name__ == '__main__':
         start_time = time.time()
         
         needs_sudo = self._needs_sudo(task.command, protected_paths)
-        success, stdout, stderr = self._execute_single_command(task.command, needs_sudo)
+        
+        # Show spinner while executing
+        from rich.status import Status
+        with Status(f"{indent}  [dim]Running...[/dim]", spinner="dots"):
+            success, stdout, stderr = self._execute_single_command(task.command, needs_sudo)
         
         task.output = stdout
         task.error = stderr
@@ -2833,8 +2937,8 @@ if __name__ == '__main__':
             # Claude-like success output
             console.print(f"{indent}  [green]✓[/green] [dim]Done ({task.duration_seconds:.2f}s)[/dim]")
             if stdout:
-                output_preview = stdout[:100] + ('...' if len(stdout) > 100 else '')
-                console.print(f"{indent}  [dim]{output_preview}[/dim]")
+                for line in stdout.strip().split('\n'):
+                    console.print(f"{indent}  [dim]{line}[/dim]")
             console.print()
             run.commands.append(cmd_log)
             return
@@ -2859,7 +2963,9 @@ if __name__ == '__main__':
                 
                 # Retry the command
                 needs_sudo = self._needs_sudo(task.command, [])
-                success, new_stdout, new_stderr = self._execute_single_command(task.command, needs_sudo)
+                from rich.status import Status
+                with Status(f"{indent}   [dim]Running...[/dim]", spinner="dots"):
+                    success, new_stdout, new_stderr = self._execute_single_command(task.command, needs_sudo)
                 
                 if success:
                     task.status = CommandStatus.SUCCESS
@@ -2873,7 +2979,9 @@ if __name__ == '__main__':
                     # Still failed after login
                     stderr = new_stderr
                     diagnosis = self._diagnoser.diagnose_error(task.command, stderr)
-                    console.print(f"{indent}[yellow]   Command still failed: {stderr[:100]}[/yellow]")
+                    console.print(f"{indent}[yellow]   Command still failed:[/yellow]")
+                    for line in stderr.strip().split('\n'):
+                        console.print(f"{indent}   [dim]{line}[/dim]")
             else:
                 console.print(f"{indent}[yellow]   {login_msg}[/yellow]")
         
@@ -3620,14 +3728,11 @@ Respond directly with the answer text only."""
                 if answer_match:
                     clean_answer = answer_match.group(1)
             
-            # Truncate very long answers
-            if len(clean_answer) > 500:
-                display_answer = clean_answer[:500] + "\n\n[dim]... (truncated)[/dim]"
-            else:
-                display_answer = clean_answer
+            # Show full answer with markdown rendering
+            from rich.markdown import Markdown
             
             console.print(Panel(
-                display_answer,
+                Markdown(clean_answer),
                 title="[bold white on green] 💡 Answer [/bold white on green]",
                 title_align="left",
                 border_style="green",

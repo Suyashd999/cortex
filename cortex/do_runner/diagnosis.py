@@ -2047,6 +2047,45 @@ class AutoFixer:
             for k in to_delete:
                 del self._attempted_strategies[k]
     
+    def _format_error_for_display(self, error_type: str, category: str, description: str) -> str:
+        """Format error type for human-readable display."""
+        # If we have a good description, use it
+        if description and len(description) > 10:
+            return description
+        
+        # Map technical error types to readable messages
+        error_messages = {
+            "command_not_found": "Command not found",
+            "not_found": "File or command not found",
+            "permission_denied": "Permission denied",
+            "permission_error": "Permission denied",
+            "no_such_file": "File or directory not found",
+            "package_not_found": "Package not available",
+            "connection_refused": "Connection refused",
+            "port_in_use": "Port already in use",
+            "disk_full": "Disk space full",
+            "out_of_memory": "Out of memory",
+            "syntax_error": "Syntax error in command",
+            "config_error": "Configuration error",
+            "docker_daemon_not_running": "Docker daemon not running",
+            "service_not_running": "Service not running",
+            "dependency_error": "Missing dependency",
+        }
+        
+        # Try exact match first
+        if error_type in error_messages:
+            return error_messages[error_type]
+        
+        # Try partial match
+        for key, msg in error_messages.items():
+            if key in error_type.lower():
+                return msg
+        
+        # Format the error type nicely as fallback
+        # Convert snake_case to Title Case
+        readable = error_type.replace("_", " ").title()
+        return readable
+    
     def _get_llm_fix(self, cmd: str, stderr: str, diagnosis: dict) -> dict | None:
         """Use LLM to diagnose error and suggest fix commands.
         
@@ -2230,26 +2269,25 @@ Example response:
             skipped_attempts = 0
             
             severity = current_diagnosis.get("severity", "error")
+            description = current_diagnosis.get("description", "")
             
             # Visual grouping for auto-fix attempts
             from rich.panel import Panel
             from rich.text import Text
             
-            fix_title = Text()
-            fix_title.append("🔧 AUTO-FIX ", style="bold yellow")
-            fix_title.append(f"Attempt {attempt}/{max_attempts}", style="dim")
+            # Format error type for human readability
+            readable_error = self._format_error_for_display(error_type, category, description)
             
             severity_color = "red" if severity == "critical" else "yellow"
             fix_content = Text()
             if severity == "critical":
-                fix_content.append("⚠️  CRITICAL: ", style="bold red")
-            fix_content.append(f"[{category}] ", style="dim")
-            fix_content.append(error_type, style=f"bold {severity_color}")
+                fix_content.append("⚠️ CRITICAL: ", style="bold red")
+            fix_content.append(readable_error, style=f"bold {severity_color}")
             
             console.print()
             console.print(Panel(
                 fix_content,
-                title=fix_title,
+                title=f"[bold yellow]🔧 Fix Attempt {attempt}/{max_attempts}[/bold yellow]",
                 title_align="left",
                 border_style=severity_color,
                 padding=(0, 1),
