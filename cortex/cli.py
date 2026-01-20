@@ -507,6 +507,64 @@ class CortexCLI:
 
     # --- End Sandbox Commands ---
 
+    def _show_ask_usage(self) -> None:
+        """Show helpful usage information for the ask command."""
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich import box
+        
+        console.print()
+        
+        # Usage examples
+        examples = Table(
+            show_header=False,
+            box=box.SIMPLE,
+            padding=(0, 2),
+            expand=False,
+        )
+        examples.add_column("Command", style="cyan")
+        examples.add_column("Description", style="dim")
+        
+        examples.add_row(
+            'cortex ask "What Python version do I have?"',
+            "Ask about your system (read-only)"
+        )
+        examples.add_row(
+            'cortex ask "Is nginx installed?"',
+            "Check installed packages"
+        )
+        examples.add_row(
+            'cortex ask "How much disk space is left?"',
+            "Get system information"
+        )
+        examples.add_row(
+            'cortex ask --do "install nginx"',
+            "Execute commands (with approval)"
+        )
+        examples.add_row(
+            'cortex ask --do',
+            "Start interactive session"
+        )
+        
+        content = (
+            "[bold white]Usage:[/bold white] cortex ask [OPTIONS] <question>\n\n"
+            "[bold white]Options:[/bold white]\n"
+            "  [cyan]--do[/cyan]      Enable do mode - can execute commands to solve problems\n"
+            "  [cyan]--debug[/cyan]   Show debug output for the agentic loop\n\n"
+            "[bold white]Examples:[/bold white]\n"
+        )
+        
+        console.print(Panel(
+            content,
+            title="[bold cyan]cortex ask[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+        console.print(examples)
+        console.print()
+        console.print("[dim]Run [cyan]cortex ask --do[/cyan] to start an interactive session where Cortex can help you solve problems.[/dim]")
+        console.print()
+
     def ask(self, question: str | None, debug: bool = False, do_mode: bool = False) -> int:
         """Answer a natural language question about the system.
         
@@ -542,7 +600,7 @@ class CortexCLI:
             if question is None and do_mode:
                 return self._run_interactive_do_session(handler)
             elif question is None:
-                self._print_error("Please provide a question or use --do for interactive mode")
+                self._show_ask_usage()
                 return 1
             
             answer = handler.ask(question)
